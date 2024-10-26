@@ -15,6 +15,9 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+DATASETS_DIR = "/datasets/nanogpt"
+LOGS_DIR = "/logs/nanogpt"
+
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -334,8 +337,8 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = f"{DATASETS_DIR}/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    input_val_bin : str = f"{DATASETS_DIR}/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
@@ -414,9 +417,9 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 # begin logging
 if master_process:
     run_id = str(uuid.uuid4())
-    logdir = 'logs/%s/' % run_id
+    logdir = f"{LOGS_DIR}/{run_id}/"
     os.makedirs(logdir, exist_ok=True)
-    logfile = 'logs/%s.txt' % run_id
+    logfile = f"{LOGS_DIR}/{run_id}.txt"
     # create the log file
     with open(logfile, "w") as f:
         # begin the log by printing this file (the Python code)
@@ -479,7 +482,7 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
         log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        torch.save(log, f"{LOGS_DIR}/{run_id}/state_step{step:06d}.pt")
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
