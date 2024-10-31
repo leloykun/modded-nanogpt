@@ -26,7 +26,7 @@ def zeropower_via_svd(G, steps=None):
     return U @ V.T
 
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+def zeropower_via_newtonschulz5(G, steps=4, eps=1e-7):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -37,12 +37,19 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750,  2.0315)
+    assert steps == 4
+    four_step_coeffs = (
+        (4.2679, -11.5699, 8.1059),
+        (3.9244, -9.7605, 6.1726),
+        (4.2325, -11.1113, 7.8289),
+        (3.9280, -7.1077, 4.1197),
+    )
     X = G.bfloat16()
     X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
-    for _ in range(steps):
+    for i in range(steps):
+        a, b, c = four_step_coeffs[i]
         A = X @ X.T
         B = A @ X
         X = a * X + b * B + c * A @ B
@@ -78,7 +85,7 @@ class Muon(torch.optim.Optimizer):
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5):
+                 backend='newtonschulz5', backend_steps=4):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
 
