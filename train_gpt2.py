@@ -21,13 +21,6 @@ LOGS_DIR = "/logs/nanogpt"
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-muon_fourstep_coeffs = (
-    (4.2679, -11.5699, 8.1059),
-    (3.9244, -9.7605, 6.1726),
-    (4.2325, -11.1113, 7.8289),
-    (3.9280, -7.1077, 4.1197),
-)
-
 def zeropower_via_svd(G, steps=None):
     U, S, V = G.svd()
     return U @ V.T
@@ -48,9 +41,15 @@ def zeropower_via_newtonschulz5(G, steps=4, eps=1e-7):
     X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
-    for a, b, c in muon_fourstep_coeffs:
+    for a, b, c in (
+        (4.2679, -11.5699, 8.1059),
+        (3.9244, -9.7605, 6.1726),
+        (4.2325, -11.1113, 7.8289),
+        (3.9280, -7.1077, 4.1197),
+    ):
         A = X @ X.T
-        X = a * X + b * (A + (c/b) * A @ A) @ X
+        B = A @ X
+        X = a * X + b * B + c * A @ B
     if G.size(0) > G.size(1):
         X = X.T
     return X
