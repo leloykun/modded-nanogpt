@@ -15,8 +15,8 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-DATASETS_DIR = "/datasets/nanogpt"
-LOGS_DIR = "/logs/nanogpt"
+DATASETS_DIR = "data"
+LOGS_DIR = "logs"
 
 # -----------------------------------------------------------------------------
 # Muon optimizer

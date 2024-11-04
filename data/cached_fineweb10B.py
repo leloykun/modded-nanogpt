@@ -2,7 +2,7 @@ import os
 import sys
 from huggingface_hub import hf_hub_download
 
-DATASETS_DIR = "/datasets/nanogpt"
+DATASETS_DIR = "data"
 
 os.makedirs(DATASETS_DIR, exist_ok=True)
 
