@@ -26,7 +26,7 @@ def zeropower_via_svd(G, steps=None):
     return U @ V.T
 
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 10, eps: float = 1e-7):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -48,38 +48,56 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
         X = a * X + b * B + c * A @ B
     if G.size(0) > G.size(1):
         X = X.T
-    return X
+    return X * max(1, G.size(0)/G.size(1))**0.5
 
-zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
+@torch.compile
+def ell_one_to_ell_p_dualizer(G: torch.Tensor, p: float):
+    # Safe Implementation:
+    # log_G = torch.log(torch.abs(G) + 1e-7)
+    # max_col_log_G = torch.max(log_G, dim=0).values
+    # sum_exp_col_G = torch.sum(torch.exp(p * (log_G - max_col_log_G.unsqueeze(dim=0))), dim=0)
+    # log_norm_col_G = (1 / p) * (torch.log(sum_exp_col_G) + p * max_col_log_G)
+    # norm_col_G = torch.exp(log_norm_col_G)
+    # normed_G = G / norm_col_G.unsqueeze(dim=0)
+    # return normed_G  # * G.size(0)**0.5
+    # Default implementation:
+    return G / torch.norm(G, p=p, dim=0)  # * G.size(0)**0.5
 
-class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
+@torch.compile
+def ell_p_to_ell_infty_dualizer(G: torch.Tensor, p: float) -> torch.Tensor:
+    q = 1 if p == float("inf") else p / (p - 1)
+    return ell_one_to_ell_p_dualizer(G.T, q).T
 
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
+@torch.compile
+def induced_operator_norm_dualizer(G: torch.Tensor, p: float, q: float, steps: int = 5) -> torch.Tensor:
+    if p == 2 and q == 2:
+        return zeropower_via_newtonschulz5(G, steps=steps)
+    elif p == 1 and q == float("inf"):
+        raise NotImplementedError("Use Adam instead.")
+    elif p == 1:
+        return ell_one_to_ell_p_dualizer(G, q)
+    elif q == float("inf"):
+        return ell_p_to_ell_infty_dualizer(G, p)
+    else:
+        raise NotImplementedError(f"Dualizer for L{p} to L{q} induced operator norm is not implemented yet.")
 
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+dualizer_backends = dict(induced_operator_norm_dualizer=induced_operator_norm_dualizer)
 
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
-        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
-    """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+class DualizerWithGradientEstimation(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr: float = 0.02,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        backend: str = "induced_operator_norm_dualizer",
+        backend_input_ell_norm: float = 2,
+        backend_output_ell_norm: float = 2,
+        backend_steps: int = 5,
+    ):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                        backend=backend, backend_input_ell_norm=backend_input_ell_norm,
+                        backend_output_ell_norm=backend_output_ell_norm, backend_steps=backend_steps)
         super().__init__(params, defaults)
 
     def step(self):
@@ -88,7 +106,7 @@ class Muon(torch.optim.Optimizer):
 
             lr = group['lr']
             momentum = group['momentum']
-            zeropower_backend = zeropower_backends[group['backend']]
+            backend = dualizer_backends[group['backend']]
 
             # generate weight updates in distributed fashion
             total_params = sum(p.numel() for p in group['params'])
@@ -106,8 +124,12 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if group['nesterov']:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
+                    g = backend(
+                        g,
+                        group["backend_input_ell_norm"],
+                        group["backend_output_ell_norm"],
+                        group["backend_steps"],
+                    )
                     updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
                 curr_idx += p.numel()
 
@@ -401,11 +423,20 @@ enable_flash_sdp(False)
 enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
-# init the optimizer(s)
+# Init the optimizer(s)
+# optimizer1 = DualizerWithGradientEstimation(
+#     [raw_model.transformer.wte.weight], lr=0.3, momentum=0.95,
+#     backend_input_ell_norm=1, backend_output_ell_norm=2)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
-optimizer3 = Muon(raw_model.transformer.h.parameters(),           lr=0.02,  momentum=0.95)
+optimizer2 = DualizerWithGradientEstimation(
+    raw_model.transformer.h.parameters(), lr=0.02, momentum=0.95,
+    backend_input_ell_norm=2, backend_output_ell_norm=2)
+# optimizer3 = DualizerWithGradientEstimation(
+#     [raw_model.lm_head.weight], lr=0.002, momentum=0.95,
+#     backend_input_ell_norm=2, backend_output_ell_norm=float('inf'))
+optimizer3 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.002, betas=(0.9, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3]
+
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
