@@ -39,13 +39,17 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 10):
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    X /= (X.norm() + 1e-7) # ensure top singular value <= 1
+    I = torch.eye(min(X.size(0), X.size(1)), device=X.device, dtype=X.dtype)
+    X.div_(X.norm() + 1e-7) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
     for _ in range(steps):
         A = X @ X.T
-        B = A @ X
-        X = a * X + b * B + c * A @ B
+        # B = A @ X
+        # X = a * X + b * B + c * A @ B
+        S = A @ (b * I + c * A)
+        torch.diagonal(S).add_(a)
+        X = S @ X
     if G.size(0) > G.size(1):
         X = X.T
     return X * max(1, G.size(0)/G.size(1))**0.5
@@ -61,8 +65,9 @@ def ell_one_to_ell_p_dualizer(G: torch.Tensor, p: float):
     # normed_G = G / norm_col_G.unsqueeze(dim=0)
     # return normed_G  # * G.size(0)**0.5
     # Default implementation:
-    return G / torch.norm(G, p=p, dim=0)  # * G.size(0)**0.5
+    return G.div_(torch.norm(G, p=p, dim=0) + 1e-7) * G.size(0)**0.5
 
+@torch.compile
 def ell_p_to_ell_infty_dualizer(G: torch.Tensor, p: float) -> torch.Tensor:
     q = 1 if p == float("inf") else p / (p - 1)
     return ell_one_to_ell_p_dualizer(G.T, q).T
@@ -422,15 +427,15 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # Init the optimizer(s)
-# optimizer1 = DualizerWithGradientEstimation(
-#     [raw_model.transformer.wte.weight], lr=0.3, momentum=0.95,
-#     backend_input_ell_norm=1, backend_output_ell_norm=2)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
+optimizer1 = DualizerWithGradientEstimation(
+    [raw_model.transformer.wte.weight], lr=0.03, momentum=0.95,
+    backend_input_ell_norm=1, backend_output_ell_norm=2)
+# optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
 optimizer2 = DualizerWithGradientEstimation(
     raw_model.transformer.h.parameters(), lr=0.02, momentum=0.95,
     backend_input_ell_norm=2, backend_output_ell_norm=2)
 # optimizer3 = DualizerWithGradientEstimation(
-#     [raw_model.lm_head.weight], lr=0.002, momentum=0.95,
+#     [raw_model.lm_head.weight], lr=0.003, momentum=0.95,
 #     backend_input_ell_norm=2, backend_output_ell_norm=float('inf'))
 optimizer3 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.002, betas=(0.9, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3]
