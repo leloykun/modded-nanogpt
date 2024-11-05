@@ -26,7 +26,7 @@ def zeropower_via_svd(G, steps=None):
     return U @ V.T
 
 @torch.compile
-def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 10, eps: float = 1e-7):
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 10):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -39,7 +39,7 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 10, eps: float = 1
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
+    X /= (X.norm() + 1e-7) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
     for _ in range(steps):
@@ -68,7 +68,6 @@ def ell_p_to_ell_infty_dualizer(G: torch.Tensor, p: float) -> torch.Tensor:
     q = 1 if p == float("inf") else p / (p - 1)
     return ell_one_to_ell_p_dualizer(G.T, q).T
 
-@torch.compile
 def induced_operator_norm_dualizer(G: torch.Tensor, p: float, q: float, steps: int = 5) -> torch.Tensor:
     if p == 2 and q == 2:
         return zeropower_via_newtonschulz5(G, steps=steps)
