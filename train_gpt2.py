@@ -63,7 +63,6 @@ def ell_one_to_ell_p_dualizer(G: torch.Tensor, p: float):
     # Default implementation:
     return G / torch.norm(G, p=p, dim=0)  # * G.size(0)**0.5
 
-@torch.compile
 def ell_p_to_ell_infty_dualizer(G: torch.Tensor, p: float) -> torch.Tensor:
     q = 1 if p == float("inf") else p / (p - 1)
     return ell_one_to_ell_p_dualizer(G.T, q).T
