@@ -25,30 +25,29 @@ def zeropower_via_svd(G, steps=None):
     U, S, V = G.svd()
     return U @ V.T
 
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750,  2.0315)
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int):
+    n, m = G.size()
     X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
-    if G.size(0) > G.size(1):
+    I = torch.eye(min(n, m), dtype=X.dtype, device=X.device)
+    X.div_(X.norm() + 1e-7)
+    if n > m:
         X = X.T
-    for _ in range(steps):
+    for a, b, c in (
+        (4.8969, -14.0610, 10.1415),
+        (4.7285, -10.0664, 5.4487),
+        (4.0968, -5.9557, 2.3200),
+        (3.0319, -3.3993, 1.1814),
+    ):
         A = X @ X.T
-        B = A @ X
-        X = a * X + b * B + c * A @ B
+        S = A @ (b * I + c * A)
+        torch.diagonal(S).add_(a)
+        X = S @ X
     if G.size(0) > G.size(1):
         X = X.T
     return X
+
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
 
