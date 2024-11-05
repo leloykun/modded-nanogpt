@@ -385,7 +385,7 @@ x, y = train_loader.next_batch()
 # this originates from Karpathy's experiments.
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
-model = model.cuda()
+model = model.to(device)
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
