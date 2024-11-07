@@ -51,75 +51,101 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 10, eps: float = 1
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
 
+config.triton.cudagraph_support_input_mutation = True
+
+@torch.compile(mode="max-autotune-no-cudagraphs", fullgraph=True)
+def compute_updates(
+    params_shard: list[torch.Tensor],
+    bufs_shard: list[torch.Tensor],
+    slice_list_shard: list[slice],
+    scale_list_shard: list[float],
+    params: list[torch.Tensor],
+    slice_list: list[slice],
+    momentum: float,
+):
+    n = sum(p.numel() for p in params)
+    updates_full_flat = torch.zeros(n, dtype=torch.bfloat16, device="cuda")
+
+    # assert all(p.grad is not None for p in self.params_shard)
+    grads_shard: torch.Tensor = [p.grad for p in params_shard]
+
+    torch._foreach_mul_(bufs_shard, momentum)
+    torch._foreach_add_(bufs_shard, grads_shard)
+    # avoid mutating inputs from eager
+    vs = torch._foreach_add(grads_shard, bufs_shard, alpha=momentum)
+    update_views_shard = [updates_full_flat[s] for s in slice_list_shard]
+    for u, s, v in zip(update_views_shard, scale_list_shard, vs):
+        torch.mul(zeropower_via_newtonschulz5(v, steps=5).flatten(), s, out=u)
+
+    # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+    dist.all_reduce(updates_full_flat, op=dist.ReduceOp.SUM)
+    return [updates_full_flat[s].view_as(p) for s, p in zip(slice_list, params)]
+
+
 class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
-        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
-    """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+    def __init__(
+        self,
+        params,
+        lr: float | torch.Tensor = 0.02,
+        momentum=0.95,
+        nesterov=True,
+        backend="newtonschulz5",
+        backend_steps=5,
+    ):
+        assert nesterov
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            backend=backend,
+            backend_steps=backend_steps,
+        )
         super().__init__(params, defaults)
+        assert len(self.param_groups) == 1
+        group = self.param_groups[0]
 
+        self.params_shard: list[torch.Tensor] = []
+        self.momentum_buffer_list_shard: list[torch.Tensor] = []
+
+        self.slice_list: list[slice] = []
+        self.slice_list_shard: list[slice] = []
+        self.scale_list_shard: list[float] = []
+
+        offset = 0
+        for i, p in enumerate(group["params"]):
+            assert isinstance(p, torch.Tensor)
+            _slice = slice(offset, offset + p.numel())
+            self.slice_list.append(_slice)
+            if i % int(os.environ["WORLD_SIZE"]) == int(os.environ["RANK"]):
+                self.params_shard.append(p)
+                buf = torch.zeros_like(p)
+                torch._dynamo.mark_static_address(buf)
+                self.momentum_buffer_list_shard.append(buf)
+
+                self.state[p]["momentum_buffer"] = buf
+
+                self.slice_list_shard.append(_slice)
+                self.scale_list_shard.append(max(1, p.size(0) / p.size(1)) ** 0.5)
+
+            offset += p.numel()
+
+    # Tensor LR is slower than excluding lr from the compiled function
     @torch.no_grad()
     def step(self):
+        group = self.param_groups[0]
 
-        for group in self.param_groups:
+        update_views = compute_updates(
+            self.params_shard,
+            self.momentum_buffer_list_shard,
+            self.slice_list_shard,
+            self.scale_list_shard,
+            group["params"],
+            self.slice_list,
+            group["momentum"],
+        )
 
-            lr = group['lr']
-            momentum = group['momentum']
-            zeropower_backend = zeropower_backends[group['backend']]
-
-            # generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in group['params'])
-            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
-            curr_idx = 0
-            for i, p in enumerate(group['params']):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
-                curr_idx += p.numel()
-
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            # deserialize and apply updates
-            curr_idx = 0
-            for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
+        # apply updates
+        torch._foreach_add_(group["params"], update_views, alpha=-group["lr"])
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
