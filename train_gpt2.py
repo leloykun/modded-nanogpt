@@ -168,6 +168,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
+        self.proj_lamb = nn.Parameter(torch.tensor(0.0)) # @leloykun
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
     def forward(self, x, v1=None):
@@ -183,7 +184,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
+        y = self.c_proj(y) * self.proj_lamb
         return y, v1
 
 class MLP(nn.Module):
@@ -193,11 +194,12 @@ class MLP(nn.Module):
         self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.proj_lamb = nn.Parameter(torch.tensor(0.0)) # @leloykun
 
     def forward(self, x):
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
+        x = self.c_proj(x) * self.proj_lamb
         return x
 
 class Block(nn.Module):
