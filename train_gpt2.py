@@ -199,9 +199,9 @@ class MLP(nn.Module):
         torch.nn.init.orthogonal_(self.c_fc.weight.data)
 
     def forward(self, x):
-        x = self.c_fc(x) * 0.5
+        x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x) * 2.0
+        x = self.c_proj(x)
         return x
 
 class Block(nn.Module):
