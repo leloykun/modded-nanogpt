@@ -15,6 +15,8 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+PRINT_GRAD_STATS = True
+
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -522,10 +524,18 @@ for step in range(args.num_iterations + 1):
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
-    if (step % 500) == 0:
-        for name, p in model.named_parameters():
-            if p.grad is not None:
-                print(name, torch.norm(p.grad, float('inf')), torch.norm(p.grad, 'nuc'))
+    if (step % 500) == 0 and PRINT_GRAD_STATS:
+        print("============== Gradient norms: ==============")
+        with open(logfile, "a") as f:
+            f.write("============== Gradient norms: ==============\n")
+            for name, p in model.named_parameters():
+                if p.grad is not None and p.ndim == 2:
+                    spectral_norm = torch.linalg.matrix_norm(p.grad.data, ord=2).item()
+                    nuclear_norm = torch.linalg.matrix_norm(p.grad.data, ord="nuc").item()
+                    print(f"{name = } | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                    f.write(f"{name = } | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
+            f.write("===========================================\n")
+        print("===========================================")
     for p in model.parameters():
         p.grad /= train_accumulation_steps
     # momentum warmup for Muon
