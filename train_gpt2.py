@@ -522,6 +522,10 @@ for step in range(args.num_iterations + 1):
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
+    if (step % 500) == 0:
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                print(name, torch.norm(p.grad, float('inf')), torch.norm(p.grad, 'nuc'))
     for p in model.parameters():
         p.grad /= train_accumulation_steps
     # momentum warmup for Muon
