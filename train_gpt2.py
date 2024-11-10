@@ -166,6 +166,9 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        torch.nn.init.orthogonal_(self.c_q.weight.data)
+        torch.nn.init.orthogonal_(self.c_k.weight.data)
+        torch.nn.init.orthogonal_(self.c_v.weight.data)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
@@ -193,11 +196,12 @@ class MLP(nn.Module):
         self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        torch.nn.init.orthogonal_(self.c_fc.weight.data)
 
     def forward(self, x):
-        x = self.c_fc(x)
+        x = self.c_fc(x) * 0.5
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
+        x = self.c_proj(x) * 2.0
         return x
 
 class Block(nn.Module):
