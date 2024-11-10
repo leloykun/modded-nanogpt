@@ -198,10 +198,10 @@ class MLP(nn.Module):
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         torch.nn.init.orthogonal_(self.c_fc.weight.data)
 
-    def forward(self, x):
-        x = self.c_fc(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.c_fc(x) * torch.tensor(0.5, dtype=x.dtype, device=x.device)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
+        x = self.c_proj(x) * torch.tensor(2.0, dtype=x.dtype, device=x.device)
         return x
 
 class Block(nn.Module):
