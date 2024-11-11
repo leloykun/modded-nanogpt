@@ -199,11 +199,12 @@ class MLP(nn.Module):
         self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         torch.nn.init.orthogonal_(self.c_fc.weight.data)
+        self.c_proj_scale = nn.Parameter(torch.tensor(2.0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
+        x = self.c_proj(x) * self.c_proj_scale
         return x
 
 class Block(nn.Module):
