@@ -49,6 +49,14 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
 
+def update_param(p: torch.Tensor, update: torch.Tensor, lr: torch.Tensor):
+    p_f32 = p.float() - lr * update.float()  # compute in FP32
+
+    # stochastic rounding logic
+    rand_16bit = torch.randint(0, 1 << 16, p.shape, device=p.device, dtype=torch.int32)
+    p_f32_bits = (p_f32.view(torch.int32) + rand_16bit) & 0xFFFF0000
+    p.copy_(p_f32_bits.view(torch.float32))
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -115,7 +123,10 @@ class Muon(torch.optim.Optimizer):
             curr_idx = 0
             for p in group['params']:
                 g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                p.data.add_(g, alpha=-lr)
+                if p.dtype == torch.bfloat16:
+                    torch.compile(update_param, fullgraph=True, dynamic=False)(p.data, g, lr)
+                else:
+                    p.data.add_(g, alpha=-lr)
                 curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
@@ -161,11 +172,11 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
         # output projection
-        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
@@ -190,8 +201,8 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -206,10 +217,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+        self.lamb = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x, v1, x0):
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x = x + self.lamb * x0
         x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
         x = x + x1
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
@@ -386,7 +397,7 @@ num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda().bfloat16()
 for m in model.modules():
-    if isinstance(m, CastedLinear):
+    if isinstance(m, CastedLinear) or isinstance(m, nn.Embedding):
         m.float()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
