@@ -162,7 +162,7 @@ def apply_rotary_emb(x, cos, sin):
 
 class CastedLinear(nn.Linear):
     def forward(self, x):
-        return F.linear(x.to(self.weight.dtype), self.weight)
+        return F.linear(x, self.weight.to(x.dtype))
 
 class CausalSelfAttention(nn.Module):
 
@@ -396,7 +396,6 @@ x, y = train_loader.next_batch()
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda().bfloat16()
-model.transformer.wte.float()
 model.lm_head.float()
 # for m in model.modules():
 #     if isinstance(m, CastedLinear) or isinstance(m, nn.Embedding):
