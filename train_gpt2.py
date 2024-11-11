@@ -162,7 +162,7 @@ def apply_rotary_emb(x, cos, sin):
 
 class CastedLinear(nn.Linear):
     def forward(self, x):
-        return F.linear(x, self.weight.to(x.dtype))
+        return F.linear(x.to(self.weight.dtype), self.weight)
 
 class CausalSelfAttention(nn.Module):
 
