@@ -524,7 +524,7 @@ for step in range(args.num_iterations + 1):
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
-    if (step % 500) == 0 and PRINT_GRAD_STATS:
+    if master_process and (step % 500) == 0 and PRINT_GRAD_STATS:
         print("============== Gradient norms: ==============")
         with open(logfile, "a") as f:
             f.write("============== Gradient norms: ==============\n")
