@@ -188,7 +188,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
-        y = self.c_proj(y) * torch.tensor(0.5, dtype=y.dtype, device=y.device)
+        y = self.c_proj(y)
         return y, v1
 
 class MLP(nn.Module):
