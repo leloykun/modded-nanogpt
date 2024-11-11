@@ -188,7 +188,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
+        y = self.c_proj(y) * torch.tensor(0.5, dtype=y.dtype, device=y.device)
         return y, v1
 
 class MLP(nn.Module):
@@ -201,9 +201,9 @@ class MLP(nn.Module):
         torch.nn.init.orthogonal_(self.c_fc.weight.data)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.c_fc(x) * torch.tensor(0.5, dtype=x.dtype, device=x.device)
+        x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x) * torch.tensor(2.0, dtype=x.dtype, device=x.device)
+        x = self.c_proj(x) * torch.tensor(0.5, dtype=x.dtype, device=x.device)
         return x
 
 class Block(nn.Module):
