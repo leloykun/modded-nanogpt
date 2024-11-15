@@ -245,7 +245,7 @@ class GPT(nn.Module):
         self.decoder_layers = config.n_layer - self.encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
-        self.v_skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
+        self.v_skip_weights = nn.Parameter(torch.zeros(self.decoder_layers))
 
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
@@ -439,7 +439,7 @@ params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]+[raw_model.skip_weights]+[raw_model.v_skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.04, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.08, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
