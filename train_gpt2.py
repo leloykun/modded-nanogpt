@@ -169,8 +169,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
-        if self.layer_id != 0:
-            self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
     def forward(self, x: torch.Tensor, v1: torch.Tensor | None = None, v_weighted_skip: torch.Tensor | None = None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -179,8 +178,7 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
         if v1 is None:
             v1 = v # v needs to be accessed by subsequent blocks
-        else:
-            v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         if v_weighted_skip is not None:
             v = v + v_weighted_skip.view_as(v)
         cos, sin = self.rotary(q)
@@ -212,12 +210,10 @@ class Block(nn.Module):
         self.layer_id = layer_id
         self.attn = CausalSelfAttention(config, layer_id)
         self.mlp = MLP(config)
-        if self.layer_id != 0:
-            self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x, v1, x0, v_weighted_skip=None):
-        if self.layer_id != 0:
-            x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
         x1, v1, v = self.attn(F.rms_norm(x, (x.size(-1),)), v1, v_weighted_skip)
         x = x + x1
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
@@ -249,7 +245,7 @@ class GPT(nn.Module):
         self.decoder_layers = config.n_layer - self.encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
-        self.v_skip_weights = nn.Parameter(torch.zeros(self.decoder_layers))
+        self.v_skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
 
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
@@ -437,13 +433,13 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.9,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.012, betas=(0.9, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.9, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.9, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]+[raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.06, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.06, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer3 = Muon(matrix_params, lr=0.04, momentum=0.95)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
