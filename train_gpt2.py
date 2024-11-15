@@ -437,7 +437,7 @@ optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   beta
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.9, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2]+[raw_model.skip_weights]
+scalar_params = [p for p in params if p.ndim < 2]+[raw_model.skip_weights]+[raw_model.v_skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.04, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
@@ -512,6 +512,12 @@ for step in range(args.num_iterations + 1):
             print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+        # log lambdas
+        if master_process:
+            skip_weights_str = str(model.module.skip_weights)
+            v_skip_weights_str = str(model.module.v_skip_weights)
+            print(f"{skip_weights_str = }")
+            print(f"{v_skip_weights_str = }")
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
