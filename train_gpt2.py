@@ -79,6 +79,7 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
 
+    @torch.no_grad()
     def step(self):
 
         for group in self.param_groups:
