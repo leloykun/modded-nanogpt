@@ -371,7 +371,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3000 # number of iterations to run
+    num_iterations : int = 2900 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
@@ -433,12 +433,12 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.9,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.012, betas=(0.9, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.9, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.9, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]+[raw_model.skip_weights]+[raw_model.v_skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.06, momentum=0.95)
+optimizer3 = Muon(matrix_params, lr=0.04, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.08, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
