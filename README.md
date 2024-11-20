@@ -2,8 +2,8 @@
 
 This is a modified variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
-* 1.7B tokens instead of 10B
-* 7.8 minutes on 8xH100 instead of 45
+* 1.0B tokens instead of 10B
+* 5.0 minutes on 8xH100 instead of 45
 
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
@@ -13,26 +13,31 @@ It uses the following techniques:
 * Architectural shortcuts: value residual and embedding shortcut (partially following https://arxiv.org/abs/2410.17897).
 * Momentum warmup.
 * Tanh soft logit capping (following Gemma 2).
+* FlexAttention.
+
+The training has attained this speed due to the contributions of meself, [@Grad62304977](https://x.com/Grad62304977),
+[@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan), & [@KoszarskyB](https://x.com/KoszarskyB).
 
 ---
 
-## Running the training
+## Running the current record
 
 To execute the training, run the following three commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
-python data/cached_fineweb10B.py 18 # downloads only the first 1.8B training tokens to save time
+pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade # install torch 2.6.0
+python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tokens to save time
 ./run.sh
 ```
 
-The result will be a transformer with 124M active parameters trained for 3242 steps on 1.7B tokens of Fineweb [1], achieving ~3.278 validation loss.
+The result will be a transformer with 124M active parameters trained for 1875 steps on 1.0B tokens of Fineweb [1], achieving ~3.278 validation loss (w/ up to 0.005 inter-run stddev).
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 
 ## Running it on fewer GPUs or with less memory
 
 * To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`.
-* If you're running out of memory, then go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 32.
+* If you're running out of memory, then go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 32. (Update 11/19/24: Actually this is impossible now since we're using 64K seqlen with FlexAttention)
 
 Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
 will automatically adjust the gradient accumulation in order to have the same total batch size.
@@ -65,10 +70,9 @@ The following is the progression of world records for the task of *training a mo
 9. [8.2 minutes: Shortcuts & tweaks](https://x.com/kellerjordan0/status/1854296101303800108) (11/06/24) [[reproducible log](./records/110624_ShortcutsTweaks/dd7304a6-cc43-4d5e-adb8-c070111464a1.txt)]
 11. [7.8 minutes: Bfloat16 activations](https://x.com/kellerjordan0/status/1855267054774865980) (11/08/24) [[reproducible log](./records/110824_CastBf16/a833bed8-2fa8-4cfe-af05-58c1cc48bc30.txt)]
 12. [7.23 minutes: U-net & 2x lr](https://x.com/kellerjordan0/status/1856053121103093922) (11/10/24) [[reproducible log](./records/111024_UNetDoubleLr/c87bb826-797b-4f37-98c7-d3a5dad2de74.txt)]
+13. [5.0 minutes: FlexAttention]() (11/19/24) [[reproducible log](./records/111924_FlexAttention/8384493d-dba9-4991-b16b-8696953f5e6d.txt)] (requires PyTorch 2.6.0)
 
 Please see the X threads for the contributors to each record.
-
-The `train_gpt2.py` in this repo is the 11/08/24 record. To run the latest 11/10/24 record, use the code in its reproducible log.
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
@@ -96,9 +100,9 @@ yeah, those guys doing free labor who everyone constantly musters all of their i
 
 ### Speedrun rules
 
-1. Must not modify the train or validation data pipelines (except to change batch size if you want).
-2. Must use ≤ 124M active parameters per token.
-3. Must attain ≤ 3.28 val loss. A tasteful number would be 3.278 so that [this doesn't happen](./records/110924_Replicateleloykun/1621af10-aa0c-42af-bf54-8a773c63a2af.txt#L3780).
+1. Must not modify the train or validation data pipelines. (Except to change batch size & seqlen. I.e., just don't change the order of the tokens.)
+2. Must use ≤ 124M active parameters per token. (So MoE is OK, and the untied embedding matrix only contributes hidden_dim active params.)
+3. Must attain ≤ 3.28 val loss. (A tasteful number would be 3.278, so that the gap exceeds the inter-run variance.)
 
 Other than that, go crazy! Anything is fair game
 
@@ -216,8 +220,6 @@ python data/cached_fineweb10B.py 18
 5. [Vineet Gupta, Tomer Koren, and Yoram Singer. "Shampoo: Preconditioned stochastic tensor optimization." International Conference on Machine Learning. PMLR, 2018.](https://arxiv.org/abs/1802.09568)
 6. [Anil, Rohan, et al. "Scalable second order optimization for deep learning." arXiv preprint arXiv:2002.09018 (2020).](https://arxiv.org/abs/2002.09018)
 7. [Hägele, Alexander, et al. "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations." arXiv preprint arXiv:2405.18392 (2024).](https://arxiv.org/abs/2405.18392)
-
-[![video](https://img.youtube.com/vi/dv13gl0a-FA/0.jpg)](https://www.youtube.com/watch?v=dv13gl0a-FA)
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
 
