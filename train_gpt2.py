@@ -190,6 +190,7 @@ class CausalSelfAttention(nn.Module):
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         if v_weighted_skip is not None:
             v = v + v_weighted_skip.view_as(v)
+        v = F.rms_norm(v, (v.size(-1),)) # @leloykun
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
@@ -296,7 +297,7 @@ class GPT(nn.Module):
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.decoder_layers):
             skip_connection = skip_connections.pop()  # Get the corresponding encoder output
-            v_skip_connection = v_skip_connections[i]
+            v_skip_connection = v_skip_connections.pop()
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
             v_weighted_skip = self.v_skip_weights[i] * v_skip_connection
