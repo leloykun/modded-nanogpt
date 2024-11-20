@@ -6,7 +6,6 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
-from functools import partial
 
 import numpy as np
 import torch
@@ -257,7 +256,7 @@ class GPT(nn.Module):
         self.decoder_layers = config.n_layer - self.encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
-        self.v_skip_weights = nn.Parameter(torch.zeros(self.decoder_layers))
+        self.v_skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
 
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
@@ -265,15 +264,14 @@ class GPT(nn.Module):
     def forward(self, idx, target):
 
         docs = (idx == 50256).cumsum(0)
-        def document_causal_mask(b, h, q_idx, kv_idx, window_size=1024):
+        def document_causal_mask(b, h, q_idx, kv_idx):
           causal_mask = q_idx >= kv_idx
           document_mask = docs[q_idx] == docs[kv_idx]
-          window_mask = q_idx - kv_idx < window_size
+          window_mask = q_idx - kv_idx < 1024
           return causal_mask & document_mask & window_mask
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
-        # block_mask_local = create_block_mask(partial(document_causal_mask, window_size=512), None, None, S, S, device="cuda", _compile=True)
 
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
@@ -287,7 +285,6 @@ class GPT(nn.Module):
 
         # Encoder pass - process only the first half of the blocks
         for i in range(self.encoder_layers):
-            # x, v1, v = self.transformer.h[i](x, v1, x0, None, block_mask if i % 2 == 0 else block_mask_local)
             x, v1, v = self.transformer.h[i](x, v1, x0, None, block_mask)
 
             skip_connections.append(x)  # Store the output for skip connections
@@ -300,7 +297,6 @@ class GPT(nn.Module):
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
             v_weighted_skip = self.v_skip_weights[i] * v_skip_connection
-            # x, v1, v = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0, v_weighted_skip, block_mask if i % 2 == 0 else block_mask_local)
             x, v1, v = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0, v_weighted_skip, block_mask)
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
