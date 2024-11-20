@@ -22,10 +22,12 @@ Raw logs:
   - [UNet Attention Values & -30 steps, Attempt #1](6ddabdd4-6143-48b3-822c-4503d982ce1b.txt)
   - [UNet Attention Values & -30 steps, Attempt #2](f11e3b5e-59a1-4e41-b594-152003218ba1.txt)
   - [UNet Attention Values & -30 steps, Attempt #3](4c7c3d84-906a-4751-b76b-e039aeab4ec9.txt)
+  - [UNet Attention Values & -30 steps, Attempt #3](6d7f7872-9dee-4640-bbbb-3e566e5c023f.txt)
 - 11/20 UNet Attention Values & -40 steps, 4xH100 (_Not_ statistically significant improvement)
   - [UNet Attention Values & -40 steps, Attempt #1](d6286d13-5313-44d9-bc72-b8e3e272e4de.txt)
   - [UNet Attention Values & -40 steps, Attempt #2](a101ae21-86e8-4c4d-b8c6-51222d5591cc.txt)
   - [UNet Attention Values & -40 steps, Attempt #3](2810e887-1e75-4789-a517-1dafeab04f47.txt)
+  - [UNet Attention Values & -40 steps, Attempt #3](344c3069-737a-423a-aca2-8f28cb829c3a.txt)
 - Tests: Global-Local Attention
   - [Global-Local Attention, Attempt #1](c9c10091-c5ac-4f64-af30-a21e815f675b.txt)
   - [Global-Local Attention, Attempt #2](72d09161-8ce1-4584-8af9-b04f0351b280.txt)
