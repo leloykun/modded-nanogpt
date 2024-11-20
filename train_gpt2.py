@@ -256,7 +256,7 @@ class GPT(nn.Module):
         self.decoder_layers = config.n_layer - self.encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
-        self.v_skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
+        self.v_skip_weights = nn.Parameter(torch.zeros(self.decoder_layers))
 
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
