@@ -275,7 +275,7 @@ class GPT(nn.Module):
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
-        block_mask_local = create_block_mask(partial(document_causal_mask, window_size=512), None, None, S, S, device="cuda", _compile=True)
+        # block_mask_local = create_block_mask(partial(document_causal_mask, window_size=512), None, None, S, S, device="cuda", _compile=True)
 
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
@@ -289,7 +289,8 @@ class GPT(nn.Module):
 
         # Encoder pass - process only the first half of the blocks
         for i in range(self.encoder_layers):
-            x, v1, v = self.transformer.h[i](x, v1, x0, None, block_mask if i % 2 == 0 else block_mask_local)
+            # x, v1, v = self.transformer.h[i](x, v1, x0, None, block_mask if i % 2 == 0 else block_mask_local)
+            x, v1, v = self.transformer.h[i](x, v1, x0, None, block_mask)
 
             skip_connections.append(x)  # Store the output for skip connections
             v_skip_connections.append(v)
@@ -301,7 +302,8 @@ class GPT(nn.Module):
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
             v_weighted_skip = self.v_skip_weights[i] * v_skip_connection
-            x, v1, v = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0, v_weighted_skip, block_mask if i % 2 == 0 else block_mask_local)
+            # x, v1, v = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0, v_weighted_skip, block_mask if i % 2 == 0 else block_mask_local)
+            x, v1, v = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0, v_weighted_skip, block_mask)
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
@@ -393,7 +395,7 @@ class Hyperparameters:
     batch_size : int = 8 # batch size, in sequences, across all devices
     device_batch_size : int = 1 # batch size, in sequences, per device
     sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1835 # number of iterations to run
+    num_iterations : int = 1875 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 562 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
