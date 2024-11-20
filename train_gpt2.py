@@ -6,6 +6,7 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
+from functools import partial
 
 import numpy as np
 import torch
@@ -253,14 +254,15 @@ class GPT(nn.Module):
     def forward(self, idx, target):
 
         docs = (idx == 50256).cumsum(0)
-        def document_causal_mask(b, h, q_idx, kv_idx):
+        def document_causal_mask(b, h, q_idx, kv_idx, window_size=1024):
           causal_mask = q_idx >= kv_idx
           document_mask = docs[q_idx] == docs[kv_idx]
-          window_mask = q_idx - kv_idx < 1024
+          window_mask = q_idx - kv_idx < window_size
           return causal_mask & document_mask & window_mask
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
+        block_mask_local = create_block_mask(partial(document_causal_mask, window_size=512), None, None, S, S, device="cuda", _compile=True)
 
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
@@ -272,12 +274,12 @@ class GPT(nn.Module):
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
-            x, v1 = self.transformer.h[i](x, v1, x0, block_mask)
+            x, v1 = self.transformer.h[i](x, v1, x0, block_mask if i % 2 == 0 else block_mask_local)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask)
+            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask if i % 2 == 0 else block_mask_local)
 
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
