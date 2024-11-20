@@ -246,8 +246,6 @@ class GPT(nn.Module):
         # U-net design by @brendanh0gan
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
         self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
-        # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -298,7 +296,7 @@ class GPT(nn.Module):
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.decoder_layers):
             skip_connection = skip_connections.pop()  # Get the corresponding encoder output
-            v_skip_connection = v_skip_connections.pop()
+            v_skip_connection = v_skip_connections[i]
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
             v_weighted_skip = self.v_skip_weights[i] * v_skip_connection
@@ -538,8 +536,8 @@ for step in range(args.num_iterations + 1):
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
         # log lambdas
         if master_process:
-            skip_weights_str = str(model.module.skip_weights)
-            v_skip_weights_str = str(model.module.v_skip_weights)
+            skip_weights_str = str(model.module.skip_weights.data)
+            v_skip_weights_str = str(model.module.v_skip_weights.data)
             print(f"{skip_weights_str = }")
             print(f"{v_skip_weights_str = }")
         # start the clock again
