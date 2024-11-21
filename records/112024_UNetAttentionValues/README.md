@@ -14,17 +14,17 @@ Raw logs:
   - [11/19 record, Replication Attempt #1](c4914481-6b32-4a3a-a449-41e2c595c940.txt)
   - [11/19 record, Replication Attempt #2](a9d67362-5c57-4194-936f-2f2c2795b75f.txt)
   - [11/19 record, Replication Attempt #3](7807d03c-7198-483e-a472-1fcb99d90ea2.txt)
-- 11/20 UNet Attention Values, 4xH100 (Statistically significant improvement; p-value = 0.0406)
+- 11/20 UNet Attention Values, 4xH100 (Statistically significant improvement)
   - [UNet Attention Values, Attempt #1](44ad04d7-f115-4cb8-a70c-b8b09da600a3.txt)
   - [UNet Attention Values, Attempt #2](63bd09f5-1c19-4f79-b0eb-31bdffabed2e.txt)
   - [UNet Attention Values, Attempt #3](0737e5d1-5bf3-476a-98f4-c3f7a08fde0a.txt)
   - [UNet Attention Values, Attempt #4](1da8bcf8-3280-46c3-b6d0-6811da564e33.txt)
-- 11/20 UNet Attention Values & -30 steps, 4xH100 (Statistically significant improvement; p-value = 0.0115)
+- 11/20 UNet Attention Values & -30 steps, 4xH100 (Statistically significant improvement)
   - [UNet Attention Values & -30 steps, Attempt #1](6ddabdd4-6143-48b3-822c-4503d982ce1b.txt)
   - [UNet Attention Values & -30 steps, Attempt #2](f11e3b5e-59a1-4e41-b594-152003218ba1.txt)
   - [UNet Attention Values & -30 steps, Attempt #3](4c7c3d84-906a-4751-b76b-e039aeab4ec9.txt)
   - [UNet Attention Values & -30 steps, Attempt #4](6d7f7872-9dee-4640-bbbb-3e566e5c023f.txt)
-- 11/20 UNet Attention Values & -40 steps, 4xH100 (_Not_ statistically significant improvement; p-value = 0.0542)
+- 11/20 UNet Attention Values & -40 steps, 4xH100 (_Not_ statistically significant improvement)
   - [UNet Attention Values & -40 steps, Attempt #1](d6286d13-5313-44d9-bc72-b8e3e272e4de.txt)
   - [UNet Attention Values & -40 steps, Attempt #2](a101ae21-86e8-4c4d-b8c6-51222d5591cc.txt)
   - [UNet Attention Values & -40 steps, Attempt #3](2810e887-1e75-4789-a517-1dafeab04f47.txt)
@@ -35,10 +35,18 @@ Raw logs:
 
 ---
 
-On the T-test:
+T-test results against the baseline (3.28):
 
-IMO, when new results are close to the previous record, we should require a t-test to ensure that the improvement is not due to random chance. A one-tailed t-test should suffice, but we should make sure that the variances are not assumed to be equal (i.e., Welch's t-test).
+| Record attempt | p-value | Improvement? |
+| --- | --- | --- |
+| 11/19 record, Original | 0.5495 | No |
+| 11/20 UNet Attention Values, 4xH100 | 0.0453 | Yes |
+| 11/20 UNet Attention Values & -30 steps, 4xH100 | 0.0168 | Yes |
+| 11/20 UNet Attention Values & -40 steps, 4xH100 | 0.0518 | ~No |
+| Global-Local Attention | 0.8109 | No |
+
+IMO, when new results are close to the previous record, we should require a t-test to ensure that the improvement is not due to random chance. A one-sample, one-tailed t-test against the baseline (3.28) should suffice. We could also use a two-sample t-test to compare the new results against the previous record. But we should make sure we're not making the assumption that the variances are equal (i.e. use Welch's t-test or ttest_ind with equal_var=False in Scipy).
 
 ---
 
-With help from @brendanh0gan for additional tests
+With help from [@brendanh0gan](https://x.com/brendanh0gan) for additional tests
