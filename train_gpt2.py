@@ -267,8 +267,9 @@ class GPT(nn.Module):
         def document_causal_mask(b, h, q_idx, kv_idx):
           causal_mask = q_idx >= kv_idx
           document_mask = docs[q_idx] == docs[kv_idx]
-          window_mask = q_idx - kv_idx < 1024
-          return causal_mask & document_mask & window_mask
+          # window_mask = q_idx - kv_idx < 1024
+          # return causal_mask & document_mask & window_mask
+          return causal_mask & document_mask
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
@@ -388,17 +389,17 @@ class Hyperparameters:
     input_val_bin : str = f'{DATA_FOLDER}/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
-    device_batch_size : int = 1 # batch size, in sequences, per device
-    sequence_length : int = 96*1024 # sequence length, in tokens
-    val_sequence_lenth: int = 96*1024 # sequence length, in tokens
-    num_iterations : int = 1250 # number of iterations to run
+    device_batch_size : int = 64 # batch size, in sequences, per device
+    sequence_length : int = 1024 # sequence length, in tokens
+    val_sequence_lenth: int = 1024 # sequence length, in tokens
+    num_iterations : int = 1875 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 375 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 562 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    # val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    val_tokens: int = 10223616
+    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    # val_tokens: int = 10223616
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
