@@ -16,8 +16,8 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-flex_attention = torch.compile(flex_attention)
-create_block_mask = torch.compile(create_block_mask)
+flex_attention = torch.compile(flex_attention, dynamic=False)
+create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
 DATA_FOLDER = os.environ.get("DATA_FOLDER", "data")
 LOGS_FOLDER = os.environ.get("LOGS_FOLDER", "logs")
@@ -389,7 +389,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     device_batch_size : int = 1 # batch size, in sequences, per device
-    sequence_length : int = 96*1024 # sequence length, in tokens
+    sequence_length : int = 64*1024 # sequence length, in tokens
     val_sequence_lenth: int = 64*1024 # sequence length, in tokens
     num_iterations : int = 1845 # number of iterations to run
     warmup_iters : int = 0
