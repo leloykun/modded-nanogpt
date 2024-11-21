@@ -370,14 +370,14 @@ class DistributedDataLoader:
         batch_size = self.B * self.T * self.num_processes
         buf = self.tokens[self.current_position:self.current_position+self.B*self.T+1]
         # nn.Embedding and F.cross_entropy require longs for indexing
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long, pin_memory=True)
         x = buf[:-1] # inputs
         y = buf[1:] # targets
         # advance current position and load next shard if necessary
         self.current_position += batch_size
         if self.current_position + batch_size >= len(self.tokens):
             self.advance()
-        return x.cuda(), y.cuda()
+        return x.cuda(non_blocking=True), y.cuda(non_blocking=True)
 
 # -----------------------------------------------------------------------------
 # int main
@@ -388,10 +388,10 @@ class Hyperparameters:
     input_bin : str = f'{DATA_FOLDER}/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = f'{DATA_FOLDER}/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
-    sequence_length : int = 1024 # sequence length, in tokens
-    val_sequence_lenth: int = 1024 # sequence length, in tokens
+    batch_size : int = 8 # batch size, in sequences, across all devices
+    device_batch_size : int = 1 # batch size, in sequences, per device
+    sequence_length : int = 64*1024 # sequence length, in tokens
+    val_sequence_lenth: int = 64*1024 # sequence length, in tokens
     num_iterations : int = 1875 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 562 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
