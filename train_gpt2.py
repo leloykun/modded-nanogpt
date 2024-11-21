@@ -413,8 +413,8 @@ master_process = (ddp_rank == 0) # this process will do logging, checkpointing e
 # convenience variables
 B, T, T_val = args.device_batch_size, args.sequence_length, args.val_sequence_lenth
 # calculate the number of steps to take in the val loop.
-assert args.val_tokens % (B * T * ddp_world_size) == 0
-val_steps = args.val_tokens // (B * T * ddp_world_size)
+assert args.val_tokens % (B * T_val * ddp_world_size) == 0
+val_steps = args.val_tokens // (B * T_val * ddp_world_size)
 # calculate the steps of gradient accumulation required to attain the desired global batch size.
 assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
