@@ -16,8 +16,8 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-flex_attention = torch.compile(flex_attention, dynamic=False)
-create_block_mask = torch.compile(create_block_mask, dynamic=False)
+flex_attention = torch.compile(flex_attention, dynamic=True)
+create_block_mask = torch.compile(create_block_mask, dynamic=True)
 
 DATA_FOLDER = os.environ.get("DATA_FOLDER", "data")
 LOGS_FOLDER = os.environ.get("LOGS_FOLDER", "logs")
@@ -440,11 +440,9 @@ for m in model.modules():
 
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-eval_model = torch.compile(model.eval())
-model = torch.compile(model)
+model = torch.compile(model, dynamic=True)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
-eval_model = DDP(eval_model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
@@ -520,12 +518,13 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # run validation batches
+        model.eval()
         val_loader.reset()
         val_loss = 0.0
         for _ in range(val_steps):
             with torch.no_grad():
                 x_val, y_val = val_loader.next_batch()
-                val_loss += eval_model(x_val, y_val)
+                val_loss += model(x_val, y_val)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
@@ -535,8 +534,8 @@ for step in range(args.num_iterations + 1):
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
         # log lambdas
         if master_process:
-            skip_weights_str = str(eval_model.module.skip_weights.data)
-            v_skip_weights_str = str(eval_model.module.v_skip_weights.data)
+            skip_weights_str = str(model.module.skip_weights.data)
+            v_skip_weights_str = str(model.module.v_skip_weights.data)
             print(f"{skip_weights_str = }")
             print(f"{v_skip_weights_str = }")
         # start the clock again
