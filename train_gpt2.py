@@ -16,8 +16,8 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-flex_attention = torch.compile(flex_attention, dynamic=False)
-create_block_mask = torch.compile(create_block_mask, dynamic=False)
+flex_attention = torch.compile(flex_attention)
+create_block_mask = torch.compile(create_block_mask)
 
 DATA_FOLDER = os.environ.get("DATA_FOLDER", "data")
 LOGS_FOLDER = os.environ.get("LOGS_FOLDER", "logs")
