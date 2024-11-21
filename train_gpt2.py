@@ -389,7 +389,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     device_batch_size : int = 1 # batch size, in sequences, per device
-    sequence_length : int = 64*1024 # sequence length, in tokens
+    sequence_length : int = 96*1024 # sequence length, in tokens
     val_sequence_lenth: int = 64*1024 # sequence length, in tokens
     num_iterations : int = 1845 # number of iterations to run
     warmup_iters : int = 0
@@ -440,9 +440,11 @@ for m in model.modules():
 
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
+eval_model = torch.compile(model.eval())
 model = torch.compile(model)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
+eval_model = DDP(eval_model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
@@ -518,13 +520,12 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # run validation batches
-        model.eval()
         val_loader.reset()
         val_loss = 0.0
         for _ in range(val_steps):
             with torch.no_grad():
                 x_val, y_val = val_loader.next_batch()
-                val_loss += model(x_val, y_val)
+                val_loss += eval_model(x_val, y_val)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
@@ -534,8 +535,8 @@ for step in range(args.num_iterations + 1):
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
         # log lambdas
         if master_process:
-            skip_weights_str = str(model.module.skip_weights.data)
-            v_skip_weights_str = str(model.module.v_skip_weights.data)
+            skip_weights_str = str(eval_model.module.skip_weights.data)
+            v_skip_weights_str = str(eval_model.module.v_skip_weights.data)
             print(f"{skip_weights_str = }")
             print(f"{v_skip_weights_str = }")
         # start the clock again
