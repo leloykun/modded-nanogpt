@@ -163,21 +163,20 @@ class CastedLinear(nn.Linear):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config, layer_id: int):
+    def __init__(self, config, device: str, dtype: torch.dtype):
         super().__init__()
-        self.layer_id = layer_id
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False, device=device, dtype=torch.float)
+        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False, device=device, dtype=torch.float)
+        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False, device=device, dtype=torch.float)
         # output projection
-        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False, device=device, dtype=torch.float)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
-        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        self.lamb = nn.Parameter(torch.tensor(0.5, device=device, dtype=dtype)) # @Grad62304977
 
     def forward(self, x: torch.Tensor, v1: torch.Tensor | None, v_weighted_skip: torch.Tensor | None, block_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -199,10 +198,10 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, device: str, dtype: torch.dtype):
         super().__init__()
-        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False, device=device, dtype=torch.float)
+        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False, device=device, dtype=torch.float)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -213,12 +212,11 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, layer_id: int):
+    def __init__(self, config, device: str, dtype: torch.dtype):
         super().__init__()
-        self.layer_id = layer_id
-        self.attn = CausalSelfAttention(config, layer_id)
-        self.mlp = MLP(config)
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+        self.attn = CausalSelfAttention(config, device=device, dtype=dtype)
+        self.mlp = MLP(config, device=device, dtype=dtype)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.], device=device, dtype=dtype))
 
     def forward(self, x, v1, x0, v_weighted_skip, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
@@ -239,26 +237,25 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig, device: str, dtype: torch.dtype):
         super().__init__()
 
         # U-net design by @brendanh0gan
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
         self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers, device=device, dtype=dtype))
+        self.v_skip_weights = nn.Parameter(torch.zeros(self.num_decoder_layers, device=device, dtype=dtype))
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            h = nn.ModuleList([Block(config, layer_id) for layer_id in range(config.n_layer)]),
+            wte = nn.Embedding(config.vocab_size, config.n_embd, device=device, dtype=dtype),
+            h = nn.ModuleList([
+                Block(config, device=device, dtype=dtype)
+                for _ in range(config.n_layer)
+            ]),
         ))
 
-        # U-net design by @brendanh0gan
-        self.encoder_layers = config.n_layer // 2 # Half of the layers for encoder
-        self.decoder_layers = config.n_layer - self.encoder_layers # Remaining for decoder
-        # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
-        self.v_skip_weights = nn.Parameter(torch.zeros(self.decoder_layers))
-
-        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False, device=device, dtype=torch.float)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, target):
@@ -284,20 +281,21 @@ class GPT(nn.Module):
         v_skip_connections = []
 
         # Encoder pass - process only the first half of the blocks
-        for i in range(self.encoder_layers):
+        for i in range(self.num_encoder_layers):
             x, v1, v = self.transformer.h[i](x, v1, x0, None, block_mask)
 
             skip_connections.append(x)  # Store the output for skip connections
             v_skip_connections.append(v)
 
         # Decoder pass - process the remaining blocks with weighted skip connections
-        for i in range(self.decoder_layers):
+        for i in range(self.num_decoder_layers):
             skip_connection = skip_connections.pop()  # Get the corresponding encoder output
             v_skip_connection = v_skip_connections.pop()
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
             v_weighted_skip = self.v_skip_weights[i] * v_skip_connection
-            x, v1, v = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0, v_weighted_skip, block_mask)
+            x, v1, v = self.transformer.h[self.num_encoder_layers + i](x + weighted_skip, v1, x0, v_weighted_skip, block_mask)
+
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
@@ -368,6 +366,7 @@ class DistributedDataLoader:
     def next_batch(self):
         batch_size = self.B * self.T * self.num_processes
         buf = self.tokens[self.current_position:self.current_position+self.B*self.T+1]
+        # nn.Embedding and F.cross_entropy require longs for indexing
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
         x = buf[:-1] # inputs
         y = buf[1:] # targets
@@ -389,6 +388,7 @@ class Hyperparameters:
     batch_size : int = 8 # batch size, in sequences, across all devices
     device_batch_size : int = 1 # batch size, in sequences, per device
     sequence_length : int = 96*1024 # sequence length, in tokens
+    val_sequence_lenth: int = 64*1024 # sequence length, in tokens
     num_iterations : int = 1845 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 562 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
@@ -411,7 +411,7 @@ print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
 # convenience variables
-B, T = args.device_batch_size, args.sequence_length
+B, T, T_val = args.device_batch_size, args.sequence_length, args.val_sequence_lenth
 # calculate the number of steps to take in the val loop.
 assert args.val_tokens % (B * T * ddp_world_size) == 0
 val_steps = args.val_tokens // (B * T * ddp_world_size)
@@ -421,7 +421,7 @@ train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load tokens
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T_val, ddp_rank, ddp_world_size)
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
@@ -430,11 +430,11 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
-model = model.cuda().bfloat16()
-for m in model.modules():
-    if isinstance(m, CastedLinear):
-        m.float()
+model = GPT(
+    GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768),
+    device=device,
+    dtype=torch.bfloat16,
+)
 
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
