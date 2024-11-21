@@ -370,14 +370,14 @@ class DistributedDataLoader:
         batch_size = self.B * self.T * self.num_processes
         buf = self.tokens[self.current_position:self.current_position+self.B*self.T+1]
         # nn.Embedding and F.cross_entropy require longs for indexing
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = buf[:-1] # inputs
-        y = buf[1:] # targets
+        buf = torch.from_numpy(buf.astype(np.int32)).long().pin_memory()
+        x = buf[:-1].cuda(non_blocking=True) # inputs
+        y = buf[1:].cuda(non_blocking=True) # targets
         # advance current position and load next shard if necessary
         self.current_position += batch_size
         if self.current_position + batch_size >= len(self.tokens):
             self.advance()
-        return x.cuda(), y.cuda()
+        return x, y
 
 # -----------------------------------------------------------------------------
 # int main
