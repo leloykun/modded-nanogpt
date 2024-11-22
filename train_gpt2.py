@@ -341,7 +341,7 @@ class GPT(nn.Module):
 
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
-        logits = self.lm_head_soft_cap * _tanh_approx(logits / self.lm_head_soft_cap) # @Grad62304977
+        logits = self.lm_head_soft_cap * torch.tanh(logits / self.lm_head_soft_cap) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
         return loss
