@@ -285,13 +285,15 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
-    soft_cap : int = 30
+    attention_soft_cap : int = 50
+    lm_head_soft_cap : int = 30
 
 class GPT(nn.Module):
 
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.soft_cap = config.soft_cap
+        self.attention_soft_cap = config.attention_soft_cap
+        self.lm_head_soft_cap = config.lm_head_soft_cap
 
         # U-net design by @brendanh0gan
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
@@ -307,6 +309,7 @@ class GPT(nn.Module):
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, target):
+
         docs = (idx == 50256).cumsum(0)
         def document_causal_mask(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
@@ -314,7 +317,7 @@ class GPT(nn.Module):
             window_mask = q_idx - kv_idx < 1024
             return causal_mask & document_mask & window_mask
 
-        softcap_mod = generate_tanh_softcap(self.soft_cap, approx=True)
+        softcap_mod = generate_tanh_softcap(self.attention_soft_cap, approx=True)  # @leloykun
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
@@ -338,7 +341,7 @@ class GPT(nn.Module):
 
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
-        logits = self.soft_cap * torch.tanh(logits / self.soft_cap) # @Grad62304977
+        logits = self.lm_head_soft_cap * torch.tanh(logits / self.lm_head_soft_cap) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
         return loss
