@@ -15,7 +15,11 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask, _score_mod_signature
+from torch._inductor.lowering import make_pointwise, register_lowering
+# Some internal torch.compile details
+from torch._inductor.virtualized import ops
+from functools import partial
 flex_attention = torch.compile(flex_attention, dynamic=False)
 create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
@@ -123,6 +127,56 @@ class Muon(torch.optim.Optimizer):
                 curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
+# Attention Tanh softcapping
+
+@torch.library.custom_op("approx::tanh", mutates_args=())
+def _tanh_approx(inp: torch.Tensor) -> torch.Tensor:
+    return torch.tanh(inp)
+
+@_tanh_approx.register_fake
+def _(inp: torch.Tensor) -> torch.Tensor:
+    return torch.tanh(inp)
+
+def _tanh_approx_lowering(inp):
+    fn = partial(ops.inline_asm_elementwise, asm="tanh.approx.f32 $0, $1;")
+    return make_pointwise(fn)(inp)
+
+register_lowering(torch.ops.approx.tanh)(_tanh_approx_lowering)
+
+class _TanhApprox(torch.autograd.Function):
+    @staticmethod
+    def forward(x):
+        return torch.ops.approx.tanh(x)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        (x,) = inputs
+        result = output
+        ctx.save_for_backward(result)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (result,) = ctx.saved_tensors
+        return grad_output * (1 - result * result)
+
+    @staticmethod
+    def vmap(info, in_dims, x):
+        return torch.tanh(x), 0
+
+_tanh_approx = _TanhApprox.apply
+
+def generate_tanh_softcap(soft_cap: int, approx: bool=True) -> _score_mod_signature:
+    tanh = _tanh_approx if approx else torch.tanh
+
+    def tanh_softcap(score, b, h, q_idx, kv_idx):
+        return soft_cap * tanh(score / soft_cap)
+
+    prefix = "tanh_softcap_approx" if approx else "tanh_softcap"
+    tanh_softcap.__name__ = f"{prefix}_{soft_cap}"
+
+    return tanh_softcap
+
+# -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
 class Rotary(torch.nn.Module):
@@ -177,7 +231,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
-    def forward(self, x, v1, block_mask):
+    def forward(self, x, v1, block_mask: BlockMask, score_mod: _score_mod_signature):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
@@ -188,7 +242,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), score_mod=score_mod, block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y, v1
@@ -215,9 +269,9 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, v1, x0, block_mask):
+    def forward(self, x, v1, x0, block_mask: BlockMask, score_mod: _score_mod_signature):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask)
+        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask, score_mod)
         x = x + x1
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
         return x, v1
@@ -231,11 +285,13 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    soft_cap : int = 30
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig):
         super().__init__()
+        self.soft_cap = config.soft_cap
 
         # U-net design by @brendanh0gan
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
@@ -251,13 +307,14 @@ class GPT(nn.Module):
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, target):
-
         docs = (idx == 50256).cumsum(0)
         def document_causal_mask(b, h, q_idx, kv_idx):
-          causal_mask = q_idx >= kv_idx
-          document_mask = docs[q_idx] == docs[kv_idx]
-          window_mask = q_idx - kv_idx < 1024
-          return causal_mask & document_mask & window_mask
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            window_mask = q_idx - kv_idx < 1024
+            return causal_mask & document_mask & window_mask
+
+        softcap_mod = generate_tanh_softcap(self.soft_cap, approx=True)
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
@@ -272,16 +329,16 @@ class GPT(nn.Module):
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
-            x, v1 = self.transformer.h[i](x, v1, x0, block_mask)
+            x, v1 = self.transformer.h[i](x, v1, x0, block_mask, softcap_mod)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask)
+            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask, softcap_mod)
 
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = self.soft_cap * torch.tanh(logits / self.soft_cap) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
         return loss
