@@ -228,8 +228,8 @@ class CausalSelfAttention(nn.Module):
         # Attention Entropy-aware QK init suggested by @leloykun
         # The gain should depend on the n_embd/n_head ratio
         with torch.no_grad():
-            self.c_q.weight.data = 15 * zeropower_via_newtonschulz5(self.c_q.weight.data, steps=5)
-            self.c_k.weight.data = 15 * zeropower_via_newtonschulz5(self.c_k.weight.data, steps=5)
+            self.c_q.weight.data = 7 * zeropower_via_newtonschulz5(self.c_q.weight.data, steps=5)
+            self.c_k.weight.data = 7 * zeropower_via_newtonschulz5(self.c_k.weight.data, steps=5)
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
