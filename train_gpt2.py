@@ -306,6 +306,8 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
+        with torch.no_grad():
+            self.transformer.wte.weight.data.div_(torch.norm(self.transformer.wte.weight.data, p=2, dim=0) + 1e-8)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, target, attn_blocksize: int):
