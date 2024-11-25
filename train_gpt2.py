@@ -412,10 +412,7 @@ class GPT(nn.Module):
             window_mask = q_idx - kv_idx < attn_blocksize
             return causal_mask & document_mask & window_mask
 
-        if attn_blocksize < 832:
-            softcap_mod = None
-        else:
-            softcap_mod = generate_tanh_softcap(self.attention_soft_cap, approx=True)  # @leloykun
+        softcap_mod = generate_tanh_softcap(self.attention_soft_cap, approx=False)  # @leloykun
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
@@ -656,9 +653,6 @@ for step in range(args.num_iterations + 1):
         training_time_ms = 0
         t0 = time.time()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
-
-    # Set the attention blocksize for the current step, in chunks of 64. By @fernbear.bsky.social
-    attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
