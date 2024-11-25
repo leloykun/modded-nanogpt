@@ -127,6 +127,101 @@ class Muon(torch.optim.Optimizer):
                 curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
+# DualizerWithGradientEstimation
+
+@torch.compile
+def ell_one_to_ell_p_dualizer(G: torch.Tensor, p: float):
+    # Safe Implementation:
+    # log_G = torch.log(torch.abs(G) + 1e-7)
+    # max_col_log_G = torch.max(log_G, dim=0).values
+    # sum_exp_col_G = torch.sum(torch.exp(p * (log_G - max_col_log_G.unsqueeze(dim=0))), dim=0)
+    # log_norm_col_G = (1 / p) * (torch.log(sum_exp_col_G) + p * max_col_log_G)
+    # norm_col_G = torch.exp(log_norm_col_G)
+    # normed_G = G / norm_col_G.unsqueeze(dim=0)
+    # return normed_G  # * G.size(0)**0.5
+    # Default implementation:
+    return G.div_(torch.norm(G, p=p, dim=0) + 1e-7) * G.size(0)**0.5
+
+@torch.compile
+def ell_p_to_ell_infty_dualizer(G: torch.Tensor, p: float) -> torch.Tensor:
+    q = 1 if p == float("inf") else p / (p - 1)
+    return ell_one_to_ell_p_dualizer(G.T, q).T
+
+def induced_operator_norm_dualizer(G: torch.Tensor, p: float, q: float, steps: int = 5) -> torch.Tensor:
+    if p == 2 and q == 2:
+        raise NotImplementedError("Use Muon instead.")
+    elif p == 1 and q == float("inf"):
+        raise NotImplementedError("Use Adam instead.")
+    elif p == 1:
+        return ell_one_to_ell_p_dualizer(G, q)
+    elif q == float("inf"):
+        return ell_p_to_ell_infty_dualizer(G, p)
+    else:
+        raise NotImplementedError(f"Dualizer for L{p} to L{q} induced operator norm is not implemented yet.")
+
+dualizer_backends = dict(induced_operator_norm_dualizer=induced_operator_norm_dualizer)
+
+class DualizerWithGradientEstimation(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr: float = 0.02,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        backend: str = "induced_operator_norm_dualizer",
+        backend_input_ell_norm: float = 2,
+        backend_output_ell_norm: float = 2,
+        backend_steps: int = 5,
+    ):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                        backend=backend, backend_input_ell_norm=backend_input_ell_norm,
+                        backend_output_ell_norm=backend_output_ell_norm, backend_steps=backend_steps)
+        super().__init__(params, defaults)
+
+    def step(self):
+
+        for group in self.param_groups:
+
+            lr = group['lr']
+            momentum = group['momentum']
+            backend = dualizer_backends[group['backend']]
+
+            # generate weight updates in distributed fashion
+            total_params = sum(p.numel() for p in group['params'])
+            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            curr_idx = 0
+            for i, p in enumerate(group['params']):
+                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
+                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(g)
+                    if group['nesterov']:
+                        g = g.add(buf, alpha=momentum)
+                    g = backend(
+                        g,
+                        group["backend_input_ell_norm"],
+                        group["backend_output_ell_norm"],
+                        group["backend_steps"],
+                    )
+                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                curr_idx += p.numel()
+
+            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            # deserialize and apply updates
+            curr_idx = 0
+            for p in group['params']:
+                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                p.data.add_(g, alpha=-lr)
+                curr_idx += p.numel()
+
+# -----------------------------------------------------------------------------
 # Attention Tanh softcapping
 
 @torch.library.custom_op("approx::tanh", mutates_args=())
@@ -520,7 +615,7 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.06,   betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
