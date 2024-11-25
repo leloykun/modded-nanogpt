@@ -1,0 +1,1593 @@
+====================================================================================================
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import glob
+import time
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
+import torch.distributed as dist
+import torch._inductor.config as config
+from torch.nn.parallel import DistributedDataParallel as DDP
+# Use of FlexAttention contributed by @KoszarskyB
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask, _score_mod_signature
+from torch._inductor.lowering import make_pointwise, register_lowering
+# Some internal torch.compile details
+from torch._inductor.virtualized import ops
+from functools import partial
+flex_attention = torch.compile(flex_attention, dynamic=False)
+create_block_mask = torch.compile(create_block_mask, dynamic=False)
+
+# -----------------------------------------------------------------------------
+# Muon optimizer
+
+def zeropower_via_svd(G, steps=None):
+    U, S, V = G.svd()
+    return U @ V.T
+
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
+        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        super().__init__(params, defaults)
+
+    def step(self):
+
+        for group in self.param_groups:
+
+            lr = group['lr']
+            momentum = group['momentum']
+            zeropower_backend = zeropower_backends[group['backend']]
+
+            # generate weight updates in distributed fashion
+            total_params = sum(p.numel() for p in group['params'])
+            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            curr_idx = 0
+            for i, p in enumerate(group['params']):
+                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
+                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(g)
+                    if group['nesterov']:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_backend(g, steps=group['backend_steps'])
+                    g *= max(1, g.size(0)/g.size(1))**0.5
+                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                curr_idx += p.numel()
+
+            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            # deserialize and apply updates
+            curr_idx = 0
+            for p in group['params']:
+                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                p.data.add_(g, alpha=-lr)
+                curr_idx += p.numel()
+
+# -----------------------------------------------------------------------------
+# Attention Tanh softcapping
+
+@torch.library.custom_op("approx::tanh", mutates_args=())
+def _tanh_approx(inp: torch.Tensor) -> torch.Tensor:
+    return torch.tanh(inp)
+
+@_tanh_approx.register_fake
+def _(inp: torch.Tensor) -> torch.Tensor:
+    return torch.tanh(inp)
+
+def _tanh_approx_lowering(inp):
+    fn = partial(ops.inline_asm_elementwise, asm="tanh.approx.f32 $0, $1;")
+    return make_pointwise(fn)(inp)
+
+register_lowering(torch.ops.approx.tanh)(_tanh_approx_lowering)
+
+class _TanhApprox(torch.autograd.Function):
+    @staticmethod
+    def forward(x):
+        return torch.ops.approx.tanh(x)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        (x,) = inputs
+        result = output
+        ctx.save_for_backward(result)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (result,) = ctx.saved_tensors
+        return grad_output * (1 - result * result)
+
+    @staticmethod
+    def vmap(info, in_dims, x):
+        return torch.tanh(x), 0
+
+_tanh_approx = _TanhApprox.apply
+
+def generate_tanh_softcap(soft_cap: int, approx: bool=True) -> _score_mod_signature:
+    tanh = _tanh_approx if approx else torch.tanh
+
+    def tanh_softcap(score, b, h, q_idx, kv_idx):
+        return soft_cap * tanh(score / soft_cap)
+
+    prefix = "tanh_softcap_approx" if approx else "tanh_softcap"
+    tanh_softcap.__name__ = f"{prefix}_{soft_cap}"
+
+    return tanh_softcap
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the GPT-2 model
+
+class Rotary(torch.nn.Module):
+
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.inv_freq = None
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4 # multihead attention
+    d = x.shape[3]//2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).type_as(x)
+
+class CastedLinear(nn.Linear):
+    def forward(self, x):
+        return F.linear(x, self.weight.to(x.dtype))
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        # output projection
+        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.rotary = Rotary(self.head_dim)
+        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+
+    def forward(self, x, v1, block_mask: BlockMask, score_mod: _score_mod_signature):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        if v1 is None:
+            v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
+        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+        cos, sin = self.rotary(q)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), score_mod=score_mod, block_mask=block_mask)
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y, v1
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config)
+        self.mlp = MLP(config)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
+    def forward(self, x, v1, x0, block_mask: BlockMask, score_mod: _score_mod_signature):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask, score_mod)
+        x = x + x1
+        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        return x, v1
+
+# -----------------------------------------------------------------------------
+# The main GPT-2 model
+
+@dataclass
+class GPTConfig:
+    vocab_size : int = 50304
+    n_layer : int = 12
+    n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    n_embd : int = 768
+    attention_soft_cap : int = 50
+    lm_head_soft_cap : int = 30
+
+class GPT(nn.Module):
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.attention_soft_cap = config.attention_soft_cap
+        self.lm_head_soft_cap = config.lm_head_soft_cap
+
+        # U-net design by @brendanh0gan
+        self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
+        self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+        ))
+        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.weight.data.zero_() # @Grad62304977
+
+    def forward(self, idx, target, attn_blocksize: int):
+
+        docs = (idx == 50256).cumsum(0)
+        def document_causal_mask(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            window_mask = q_idx - kv_idx < attn_blocksize
+            return causal_mask & document_mask & window_mask
+
+        softcap_mod = generate_tanh_softcap(self.attention_soft_cap, approx=True)  # @leloykun
+
+        S = len(idx)
+        block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
+
+        # forward the GPT model itself
+        x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
+        x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
+        x0 = x
+        v1 = None
+
+        # Store outputs for U-Net skip connections
+        skip_connections = []
+        # Encoder pass - process only the first half of the blocks
+        for i in range(self.num_encoder_layers):
+            x, v1 = self.transformer.h[i](x, v1, x0, block_mask, softcap_mod)
+            skip_connections.append(x)
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        for i in range(self.num_decoder_layers):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask, softcap_mod)
+
+        x = F.rms_norm(x, (x.size(-1),))
+        logits = self.lm_head(x)
+        logits = self.lm_head_soft_cap * torch.tanh(logits / self.lm_head_soft_cap) # @Grad62304977
+        logits = logits.float()
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        return loss
+
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240520:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --input_bin?")
+        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
+    assert header[1] == 1, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedDataLoader:
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += int(shard_ntok)
+        self.ntok_total = ntok_total
+
+        self.reset()
+
+    def reset(self):
+        self.current_shard = -1
+        self.advance()
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        batch_size = self.B * self.T * self.num_processes
+        buf = self.tokens[self.current_position:self.current_position+self.B*self.T+1]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = buf[:-1] # inputs
+        y = buf[1:] # targets
+        # advance current position and load next shard if necessary
+        self.current_position += batch_size
+        if self.current_position + batch_size >= len(self.tokens):
+            self.advance()
+        return x.cuda(), y.cuda()
+
+# -----------------------------------------------------------------------------
+# int main
+
+@dataclass
+class Hyperparameters:
+    # data hyperparams
+    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    # optimization hyperparams
+    batch_size : int = 8 # batch size, in sequences, across all devices
+    device_batch_size : int = 1 # batch size, in sequences, per device
+    sequence_length : int = 64*1024 # sequence length, in tokens
+    num_iterations : int = 1750 # number of iterations to run
+    warmup_iters : int = 0
+    cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    weight_decay : float = 0
+    # evaluation and logging hyperparams
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+args = Hyperparameters()
+
+# set up DDP (distributed data parallel). torchrun sets this env variable
+assert torch.cuda.is_available()
+dist.init_process_group(backend='nccl')
+ddp_rank = int(os.environ['RANK'])
+ddp_local_rank = int(os.environ['LOCAL_RANK'])
+ddp_world_size = int(os.environ['WORLD_SIZE'])
+device = f'cuda:{ddp_local_rank}'
+torch.cuda.set_device(device)
+print(f"using device: {device}")
+master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+
+# begin logging
+logfile = None
+if master_process:
+    run_id = str(uuid.uuid4())
+    logdir = 'logs/%s/' % run_id
+    os.makedirs(logdir, exist_ok=True)
+    logfile = 'logs/%s.txt' % run_id
+    # create the log file
+    with open(logfile, "w") as f:
+        # begin the log by printing this file (the Python code)
+        f.write('='*100 + '\n')
+        f.write(code)
+        f.write('='*100 + '\n')
+def print0(s, logonly=False):
+    if master_process:
+        with open(logfile, "a") as f:
+            if not logonly:
+                print(s)
+            f.write(s+'\n')
+# log information about the hardware/software environment this is running on
+# and print the full `nvidia-smi` to file
+print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
+import subprocess
+result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+print0(f'{result.stdout}', logonly=True)
+print0('='*100, logonly=True)
+
+# convenience variables
+B, T = args.device_batch_size, args.sequence_length
+# calculate the number of steps to take in the val loop.
+assert args.val_tokens % (B * T * ddp_world_size) == 0
+val_steps = args.val_tokens // (B * T * ddp_world_size)
+# calculate the steps of gradient accumulation required to attain the desired global batch size.
+assert args.batch_size % (B * ddp_world_size) == 0
+train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+
+# load tokens
+train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+print0('='*100, logonly=True)
+x, y = train_loader.next_batch()
+
+# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+# this originates from Karpathy's experiments.
+num_vocab = 50304
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = model.cuda().bfloat16()
+for m in model.modules():
+    if isinstance(m, CastedLinear):
+        m.float()
+if hasattr(config, "coordinate_descent_tuning"):
+    config.coordinate_descent_tuning = True # suggested by @Chillee
+model = torch.compile(model)
+# here we wrap model into DDP container
+model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module # always contains the "raw" unwrapped model
+
+# CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
+from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+enable_cudnn_sdp(True)
+enable_flash_sdp(False)
+enable_mem_efficient_sdp(False)
+enable_math_sdp(False)
+
+# init the optimizer(s)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
+params = list(raw_model.transformer.h.parameters())
+matrix_params = [p for p in params if p.ndim == 2]
+scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+# learning rate decay scheduler (linear warmup and cooldown)
+def get_lr(it):
+    assert it <= args.num_iterations
+    # 1) linear warmup for warmup_iters steps
+    if it < args.warmup_iters:
+        return (it+1) / args.warmup_iters
+    # 2) constant lr for a while
+    elif it < args.num_iterations - args.cooldown_iters:
+        return 1.0
+    # 3) linear cooldown
+    else:
+        decay_ratio = (args.num_iterations - it) / args.cooldown_iters
+        return decay_ratio
+schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+# Start training loop
+training_time_ms = 0
+# start the clock
+torch.cuda.synchronize()
+t0 = time.time()
+# begin training
+for step in range(args.num_iterations + 1):
+    last_step = (step == args.num_iterations)
+    # Set the attention blocksize for the current step, in chunks of 64
+    attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
+    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+    # steps with dummy data first, and then re-initialize the model and reset the loader.
+    if step == 10:
+        training_time_ms = 0
+        t0 = time.time()
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+    # Set the attention blocksize for the current step, in chunks of 64. By @fernbear.bsky.social
+    attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
+
+    # once in a while evaluate the validation dataset
+    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # run validation batches
+        model.eval()
+        val_loader.reset()
+        val_loss = 0.0
+        for _ in range(val_steps):
+            with torch.no_grad():
+                x_val, y_val = val_loader.next_batch()
+                val_loss += model(x_val, y_val, attn_blocksize=attn_blocksize)
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        val_loss /= val_steps
+        # log val loss to console and to logfile
+        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        if master_process:
+            print("============== Weight norms: ==============")
+            with open(logfile, "a") as f:
+                f.write("============== Weight norms: ==============\n")
+                for name, p in model.named_parameters():
+                    if p.ndim != 2:
+                        continue
+                    l1_to_l2_norm = torch.norm(p.data.float(), p=2, dim=0).mean().item()
+                    frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
+                    spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
+                    nuclear_norm = torch.linalg.matrix_norm(p.data.float(), ord="nuc").item()
+                    print(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                    f.write(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
+                f.write("===========================================\n")
+            print("===========================================")
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
+
+    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # save the state of the training process
+        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
+
+    # bit confusing: we want to make sure to eval on 0th iteration
+    # but also after the very last iteration. so we loop for step <= num_iterations
+    # instead of just < num_iterations (one extra due to <=), only to do
+    # the validation/sampling one last time, and then we break right here as we're done.
+    if last_step:
+        break
+
+    # --------------- TRAINING SECTION BEGIN -----------------
+    model.train()
+    for i in range(1, train_accumulation_steps+1):
+        # forward pass
+        loss = model(x, y, attn_blocksize=attn_blocksize)
+        train_loss = loss.detach()
+        # advance the dataset for the next batch
+        x, y = train_loader.next_batch()
+        # backward pass
+        if i < train_accumulation_steps:
+            with model.no_sync(): # there's no need to sync gradients every accumulation step
+                loss.backward()
+        else:
+            loss.backward() # just sync on the last step
+    for p in model.parameters():
+        p.grad /= train_accumulation_steps
+    # momentum warmup for Muon
+    frac = min(step/300, 1)
+    optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    # step the optimizers and schedulers
+    for opt, sched in zip(optimizers, schedulers):
+        opt.step()
+        sched.step()
+    # null the gradients
+    model.zero_grad(set_to_none=True)
+    # --------------- TRAINING SECTION END -------------------
+    # everything that follows now is just diagnostics, prints, logging, etc.
+
+    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    approx_time = training_time_ms + 1000 * (time.time() - t0)
+    print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+
+if master_process:
+    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+# -------------------------------------------------------------------------
+# clean up nice
+dist.destroy_process_group()
+====================================================================================================
+Running pytorch 2.6.0.dev20241124+cu124 compiled for CUDA 12.4
+nvidia-smi:
+Mon Nov 25 09:01:19 2024       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.90.07              Driver Version: 550.90.07      CUDA Version: 12.4     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100-SXM4-80GB          On  |   00000000:4E:00.0 Off |                    0 |
+| N/A   31C    P0             68W /  400W |   32907MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A100-SXM4-80GB          On  |   00000000:87:00.0 Off |                    0 |
+| N/A   49C    P0             75W /  400W |      21MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA A100-SXM4-80GB          On  |   00000000:90:00.0 Off |                    0 |
+| N/A   34C    P0             69W /  400W |     423MiB /  81920MiB |      1%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA A100-SXM4-80GB          On  |   00000000:B7:00.0 Off |                    0 |
+| N/A   33C    P0             68W /  400W |      31MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+Training DataLoader: total number of tokens: 1100000000 across 11 files
+Validation DataLoader: total number of tokens: 100000000 across 1 files
+====================================================================================================
+step:0/1750 val_loss:10.8258 train_time:0ms step_avg:nanms
+============== Weight norms: ==============
+name = 'module._orig_mod.transformer.wte.weight' | l1_to_l2_norm = 224.28806 | frobenius_norm = 6215.68359 | spectral_norm = 252.49745 | nuclear_norm = 171945.90625
+name = 'module._orig_mod.transformer.h.0.attn.c_q.weight' | l1_to_l2_norm = 0.57712 | frobenius_norm = 15.99581 | spectral_norm = 1.15079 | nuclear_norm = 376.30896
+name = 'module._orig_mod.transformer.h.0.attn.c_k.weight' | l1_to_l2_norm = 0.57679 | frobenius_norm = 15.98667 | spectral_norm = 1.13581 | nuclear_norm = 376.18304
+name = 'module._orig_mod.transformer.h.0.attn.c_v.weight' | l1_to_l2_norm = 0.57773 | frobenius_norm = 16.01234 | spectral_norm = 1.15575 | nuclear_norm = 376.44873
+name = 'module._orig_mod.transformer.h.0.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.0.mlp.c_fc.weight' | l1_to_l2_norm = 1.15499 | frobenius_norm = 32.00908 | spectral_norm = 1.72461 | nuclear_norm = 858.49292
+name = 'module._orig_mod.transformer.h.0.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.1.attn.c_q.weight' | l1_to_l2_norm = 0.57652 | frobenius_norm = 15.97907 | spectral_norm = 1.14245 | nuclear_norm = 375.95535
+name = 'module._orig_mod.transformer.h.1.attn.c_k.weight' | l1_to_l2_norm = 0.57694 | frobenius_norm = 15.99070 | spectral_norm = 1.14427 | nuclear_norm = 376.20844
+name = 'module._orig_mod.transformer.h.1.attn.c_v.weight' | l1_to_l2_norm = 0.57696 | frobenius_norm = 15.99103 | spectral_norm = 1.14200 | nuclear_norm = 376.11444
+name = 'module._orig_mod.transformer.h.1.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.1.mlp.c_fc.weight' | l1_to_l2_norm = 1.15436 | frobenius_norm = 31.99161 | spectral_norm = 1.72370 | nuclear_norm = 857.98572
+name = 'module._orig_mod.transformer.h.1.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.2.attn.c_q.weight' | l1_to_l2_norm = 0.57720 | frobenius_norm = 15.99801 | spectral_norm = 1.15261 | nuclear_norm = 376.34961
+name = 'module._orig_mod.transformer.h.2.attn.c_k.weight' | l1_to_l2_norm = 0.57687 | frobenius_norm = 15.98886 | spectral_norm = 1.14032 | nuclear_norm = 376.07446
+name = 'module._orig_mod.transformer.h.2.attn.c_v.weight' | l1_to_l2_norm = 0.57749 | frobenius_norm = 16.00601 | spectral_norm = 1.14641 | nuclear_norm = 376.53424
+name = 'module._orig_mod.transformer.h.2.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.2.mlp.c_fc.weight' | l1_to_l2_norm = 1.15470 | frobenius_norm = 32.00104 | spectral_norm = 1.72231 | nuclear_norm = 858.26581
+name = 'module._orig_mod.transformer.h.2.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.3.attn.c_q.weight' | l1_to_l2_norm = 0.57751 | frobenius_norm = 16.00649 | spectral_norm = 1.15517 | nuclear_norm = 376.49304
+name = 'module._orig_mod.transformer.h.3.attn.c_k.weight' | l1_to_l2_norm = 0.57806 | frobenius_norm = 16.02179 | spectral_norm = 1.14915 | nuclear_norm = 376.74738
+name = 'module._orig_mod.transformer.h.3.attn.c_v.weight' | l1_to_l2_norm = 0.57746 | frobenius_norm = 16.00500 | spectral_norm = 1.15381 | nuclear_norm = 376.37933
+name = 'module._orig_mod.transformer.h.3.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.3.mlp.c_fc.weight' | l1_to_l2_norm = 1.15435 | frobenius_norm = 31.99113 | spectral_norm = 1.72351 | nuclear_norm = 858.05249
+name = 'module._orig_mod.transformer.h.3.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.4.attn.c_q.weight' | l1_to_l2_norm = 0.57696 | frobenius_norm = 15.99136 | spectral_norm = 1.14250 | nuclear_norm = 376.24213
+name = 'module._orig_mod.transformer.h.4.attn.c_k.weight' | l1_to_l2_norm = 0.57722 | frobenius_norm = 15.99849 | spectral_norm = 1.14781 | nuclear_norm = 376.35883
+name = 'module._orig_mod.transformer.h.4.attn.c_v.weight' | l1_to_l2_norm = 0.57687 | frobenius_norm = 15.98885 | spectral_norm = 1.14224 | nuclear_norm = 376.11148
+name = 'module._orig_mod.transformer.h.4.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.4.mlp.c_fc.weight' | l1_to_l2_norm = 1.15471 | frobenius_norm = 32.00127 | spectral_norm = 1.73005 | nuclear_norm = 858.30701
+name = 'module._orig_mod.transformer.h.4.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.5.attn.c_q.weight' | l1_to_l2_norm = 0.57776 | frobenius_norm = 16.01329 | spectral_norm = 1.15203 | nuclear_norm = 376.70560
+name = 'module._orig_mod.transformer.h.5.attn.c_k.weight' | l1_to_l2_norm = 0.57728 | frobenius_norm = 16.00021 | spectral_norm = 1.15057 | nuclear_norm = 376.50964
+name = 'module._orig_mod.transformer.h.5.attn.c_v.weight' | l1_to_l2_norm = 0.57796 | frobenius_norm = 16.01924 | spectral_norm = 1.15748 | nuclear_norm = 376.79141
+name = 'module._orig_mod.transformer.h.5.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.5.mlp.c_fc.weight' | l1_to_l2_norm = 1.15483 | frobenius_norm = 32.00459 | spectral_norm = 1.72605 | nuclear_norm = 858.38684
+name = 'module._orig_mod.transformer.h.5.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.6.attn.c_q.weight' | l1_to_l2_norm = 0.57752 | frobenius_norm = 16.00691 | spectral_norm = 1.15355 | nuclear_norm = 376.34695
+name = 'module._orig_mod.transformer.h.6.attn.c_k.weight' | l1_to_l2_norm = 0.57717 | frobenius_norm = 15.99728 | spectral_norm = 1.14953 | nuclear_norm = 376.37604
+name = 'module._orig_mod.transformer.h.6.attn.c_v.weight' | l1_to_l2_norm = 0.57745 | frobenius_norm = 16.00475 | spectral_norm = 1.14482 | nuclear_norm = 376.45267
+name = 'module._orig_mod.transformer.h.6.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.6.mlp.c_fc.weight' | l1_to_l2_norm = 1.15470 | frobenius_norm = 32.00088 | spectral_norm = 1.72406 | nuclear_norm = 858.27679
+name = 'module._orig_mod.transformer.h.6.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.7.attn.c_q.weight' | l1_to_l2_norm = 0.57753 | frobenius_norm = 16.00691 | spectral_norm = 1.15180 | nuclear_norm = 376.61292
+name = 'module._orig_mod.transformer.h.7.attn.c_k.weight' | l1_to_l2_norm = 0.57711 | frobenius_norm = 15.99549 | spectral_norm = 1.14858 | nuclear_norm = 376.27414
+name = 'module._orig_mod.transformer.h.7.attn.c_v.weight' | l1_to_l2_norm = 0.57706 | frobenius_norm = 15.99402 | spectral_norm = 1.14924 | nuclear_norm = 376.01678
+name = 'module._orig_mod.transformer.h.7.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.7.mlp.c_fc.weight' | l1_to_l2_norm = 1.15447 | frobenius_norm = 31.99455 | spectral_norm = 1.73142 | nuclear_norm = 858.19238
+name = 'module._orig_mod.transformer.h.7.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.8.attn.c_q.weight' | l1_to_l2_norm = 0.57755 | frobenius_norm = 16.00767 | spectral_norm = 1.14551 | nuclear_norm = 376.60553
+name = 'module._orig_mod.transformer.h.8.attn.c_k.weight' | l1_to_l2_norm = 0.57749 | frobenius_norm = 16.00574 | spectral_norm = 1.14167 | nuclear_norm = 376.56720
+name = 'module._orig_mod.transformer.h.8.attn.c_v.weight' | l1_to_l2_norm = 0.57788 | frobenius_norm = 16.01684 | spectral_norm = 1.15106 | nuclear_norm = 376.81876
+name = 'module._orig_mod.transformer.h.8.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.8.mlp.c_fc.weight' | l1_to_l2_norm = 1.15510 | frobenius_norm = 32.01221 | spectral_norm = 1.71793 | nuclear_norm = 858.52930
+name = 'module._orig_mod.transformer.h.8.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.9.attn.c_q.weight' | l1_to_l2_norm = 0.57625 | frobenius_norm = 15.97137 | spectral_norm = 1.14951 | nuclear_norm = 375.72577
+name = 'module._orig_mod.transformer.h.9.attn.c_k.weight' | l1_to_l2_norm = 0.57700 | frobenius_norm = 15.99267 | spectral_norm = 1.14929 | nuclear_norm = 376.10577
+name = 'module._orig_mod.transformer.h.9.attn.c_v.weight' | l1_to_l2_norm = 0.57748 | frobenius_norm = 16.00588 | spectral_norm = 1.14794 | nuclear_norm = 376.64243
+name = 'module._orig_mod.transformer.h.9.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.9.mlp.c_fc.weight' | l1_to_l2_norm = 1.15455 | frobenius_norm = 31.99687 | spectral_norm = 1.72897 | nuclear_norm = 858.03760
+name = 'module._orig_mod.transformer.h.9.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.10.attn.c_q.weight' | l1_to_l2_norm = 0.57704 | frobenius_norm = 15.99336 | spectral_norm = 1.14467 | nuclear_norm = 376.20874
+name = 'module._orig_mod.transformer.h.10.attn.c_k.weight' | l1_to_l2_norm = 0.57656 | frobenius_norm = 15.98039 | spectral_norm = 1.14967 | nuclear_norm = 375.83734
+name = 'module._orig_mod.transformer.h.10.attn.c_v.weight' | l1_to_l2_norm = 0.57634 | frobenius_norm = 15.97408 | spectral_norm = 1.14820 | nuclear_norm = 375.68396
+name = 'module._orig_mod.transformer.h.10.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.10.mlp.c_fc.weight' | l1_to_l2_norm = 1.15474 | frobenius_norm = 32.00211 | spectral_norm = 1.72269 | nuclear_norm = 858.35754
+name = 'module._orig_mod.transformer.h.10.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.11.attn.c_q.weight' | l1_to_l2_norm = 0.57743 | frobenius_norm = 16.00426 | spectral_norm = 1.15957 | nuclear_norm = 376.67303
+name = 'module._orig_mod.transformer.h.11.attn.c_k.weight' | l1_to_l2_norm = 0.57733 | frobenius_norm = 16.00167 | spectral_norm = 1.14308 | nuclear_norm = 376.27325
+name = 'module._orig_mod.transformer.h.11.attn.c_v.weight' | l1_to_l2_norm = 0.57760 | frobenius_norm = 16.00874 | spectral_norm = 1.13686 | nuclear_norm = 376.69067
+name = 'module._orig_mod.transformer.h.11.attn.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.transformer.h.11.mlp.c_fc.weight' | l1_to_l2_norm = 1.15494 | frobenius_norm = 32.00773 | spectral_norm = 1.72638 | nuclear_norm = 858.44489
+name = 'module._orig_mod.transformer.h.11.mlp.c_proj.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+name = 'module._orig_mod.lm_head.weight' | l1_to_l2_norm = 0.00000 | frobenius_norm = 0.00000 | spectral_norm = 0.00000 | nuclear_norm = 0.00000
+===========================================
+step:1/1750 train_loss:10.8258 train_time:27703ms step_avg:nanms
+step:2/1750 train_loss:10.1334 train_time:28341ms step_avg:nanms
+step:3/1750 train_loss:8.4468 train_time:28998ms step_avg:nanms
+step:4/1750 train_loss:7.6599 train_time:29653ms step_avg:nanms
+step:5/1750 train_loss:7.4015 train_time:30310ms step_avg:nanms
+step:6/1750 train_loss:7.0172 train_time:30967ms step_avg:nanms
+step:7/1750 train_loss:7.0074 train_time:31625ms step_avg:nanms
+step:8/1750 train_loss:6.4511 train_time:32284ms step_avg:nanms
+step:9/1750 train_loss:6.7700 train_time:32942ms step_avg:nanms
+step:10/1750 train_loss:6.5472 train_time:33602ms step_avg:nanms
+step:11/1750 train_loss:6.5202 train_time:647ms step_avg:nanms
+step:12/1750 train_loss:6.2951 train_time:1308ms step_avg:nanms
+step:13/1750 train_loss:6.2957 train_time:1967ms step_avg:655.51ms
+step:14/1750 train_loss:6.2096 train_time:2626ms step_avg:656.38ms
+step:15/1750 train_loss:6.2204 train_time:3284ms step_avg:656.84ms
+step:16/1750 train_loss:6.0075 train_time:3945ms step_avg:657.48ms
+step:17/1750 train_loss:5.9740 train_time:4607ms step_avg:658.08ms
+step:18/1750 train_loss:6.5308 train_time:5267ms step_avg:658.39ms
+step:19/1750 train_loss:5.9780 train_time:5928ms step_avg:658.68ms
+step:20/1750 train_loss:6.1002 train_time:6588ms step_avg:658.79ms
+step:21/1750 train_loss:6.0414 train_time:7247ms step_avg:658.81ms
+step:22/1750 train_loss:5.8043 train_time:7907ms step_avg:658.91ms
+step:23/1750 train_loss:5.8870 train_time:8568ms step_avg:659.08ms
+step:24/1750 train_loss:5.9096 train_time:9229ms step_avg:659.19ms
+step:25/1750 train_loss:5.6895 train_time:9890ms step_avg:659.35ms
+step:26/1750 train_loss:5.8312 train_time:10552ms step_avg:659.48ms
+step:27/1750 train_loss:5.7515 train_time:11214ms step_avg:659.66ms
+step:28/1750 train_loss:5.7110 train_time:11878ms step_avg:659.88ms
+step:29/1750 train_loss:5.7623 train_time:12538ms step_avg:659.92ms
+step:30/1750 train_loss:5.7913 train_time:13200ms step_avg:660.02ms
+step:31/1750 train_loss:6.1358 train_time:13861ms step_avg:660.03ms
+step:32/1750 train_loss:5.6185 train_time:14523ms step_avg:660.12ms
+step:33/1750 train_loss:5.4681 train_time:15182ms step_avg:660.11ms
+step:34/1750 train_loss:5.5008 train_time:15845ms step_avg:660.19ms
+step:35/1750 train_loss:5.7209 train_time:16505ms step_avg:660.19ms
+step:36/1750 train_loss:5.6211 train_time:17167ms step_avg:660.26ms
+step:37/1750 train_loss:5.6180 train_time:17830ms step_avg:660.36ms
+step:38/1750 train_loss:5.4745 train_time:18490ms step_avg:660.35ms
+step:39/1750 train_loss:5.5422 train_time:19152ms step_avg:660.40ms
+step:40/1750 train_loss:5.3201 train_time:19810ms step_avg:660.33ms
+step:41/1750 train_loss:5.5248 train_time:20471ms step_avg:660.35ms
+step:42/1750 train_loss:5.3882 train_time:21132ms step_avg:660.36ms
+step:43/1750 train_loss:5.4004 train_time:21791ms step_avg:660.32ms
+step:44/1750 train_loss:5.3169 train_time:22450ms step_avg:660.30ms
+step:45/1750 train_loss:5.1693 train_time:23111ms step_avg:660.32ms
+step:46/1750 train_loss:5.2562 train_time:23772ms step_avg:660.33ms
+step:47/1750 train_loss:5.1933 train_time:24432ms step_avg:660.34ms
+step:48/1750 train_loss:5.3368 train_time:25091ms step_avg:660.30ms
+step:49/1750 train_loss:5.1841 train_time:25753ms step_avg:660.34ms
+step:50/1750 train_loss:5.2173 train_time:26413ms step_avg:660.33ms
+step:51/1750 train_loss:5.2136 train_time:27073ms step_avg:660.32ms
+step:52/1750 train_loss:5.3276 train_time:27734ms step_avg:660.34ms
+step:53/1750 train_loss:5.1449 train_time:28393ms step_avg:660.29ms
+step:54/1750 train_loss:5.2043 train_time:29052ms step_avg:660.27ms
+step:55/1750 train_loss:5.1171 train_time:29712ms step_avg:660.27ms
+step:56/1750 train_loss:5.1371 train_time:30371ms step_avg:660.24ms
+step:57/1750 train_loss:5.1436 train_time:31031ms step_avg:660.23ms
+step:58/1750 train_loss:5.1672 train_time:31692ms step_avg:660.24ms
+step:59/1750 train_loss:5.1715 train_time:32350ms step_avg:660.20ms
+step:60/1750 train_loss:5.0490 train_time:33009ms step_avg:660.19ms
+step:61/1750 train_loss:5.1567 train_time:33670ms step_avg:660.19ms
+step:62/1750 train_loss:5.1578 train_time:34329ms step_avg:660.18ms
+step:63/1750 train_loss:5.1058 train_time:34987ms step_avg:660.14ms
+step:64/1750 train_loss:5.0687 train_time:35648ms step_avg:660.14ms
+step:65/1750 train_loss:4.9104 train_time:36306ms step_avg:660.11ms
+step:66/1750 train_loss:4.9631 train_time:36964ms step_avg:660.08ms
+step:67/1750 train_loss:5.0765 train_time:37623ms step_avg:660.05ms
+step:68/1750 train_loss:5.0385 train_time:38281ms step_avg:660.02ms
+step:69/1750 train_loss:5.0780 train_time:38940ms step_avg:659.99ms
+step:70/1750 train_loss:4.9587 train_time:39598ms step_avg:659.96ms
+step:71/1750 train_loss:5.0334 train_time:40256ms step_avg:659.93ms
+step:72/1750 train_loss:4.9936 train_time:40914ms step_avg:659.91ms
+step:73/1750 train_loss:4.9786 train_time:41574ms step_avg:659.90ms
+step:74/1750 train_loss:4.8441 train_time:42232ms step_avg:659.88ms
+step:75/1750 train_loss:4.8833 train_time:42890ms step_avg:659.84ms
+step:76/1750 train_loss:4.7598 train_time:43547ms step_avg:659.80ms
+step:77/1750 train_loss:4.9873 train_time:44206ms step_avg:659.79ms
+step:78/1750 train_loss:4.9163 train_time:44865ms step_avg:659.78ms
+step:79/1750 train_loss:4.6319 train_time:45522ms step_avg:659.74ms
+step:80/1750 train_loss:4.9309 train_time:46180ms step_avg:659.72ms
+step:81/1750 train_loss:4.8545 train_time:46839ms step_avg:659.70ms
+step:82/1750 train_loss:4.8835 train_time:47495ms step_avg:659.66ms
+step:83/1750 train_loss:4.8941 train_time:48154ms step_avg:659.64ms
+step:84/1750 train_loss:4.7772 train_time:48812ms step_avg:659.62ms
+step:85/1750 train_loss:4.7849 train_time:49470ms step_avg:659.60ms
+step:86/1750 train_loss:4.8858 train_time:50127ms step_avg:659.57ms
+step:87/1750 train_loss:4.8754 train_time:50785ms step_avg:659.55ms
+step:88/1750 train_loss:4.7138 train_time:51444ms step_avg:659.54ms
+step:89/1750 train_loss:4.7273 train_time:52101ms step_avg:659.50ms
+step:90/1750 train_loss:4.6860 train_time:52759ms step_avg:659.49ms
+step:91/1750 train_loss:4.8114 train_time:53417ms step_avg:659.47ms
+step:92/1750 train_loss:4.7829 train_time:54074ms step_avg:659.44ms
+step:93/1750 train_loss:4.8892 train_time:54732ms step_avg:659.42ms
+step:94/1750 train_loss:4.9810 train_time:55389ms step_avg:659.40ms
+step:95/1750 train_loss:4.7211 train_time:56046ms step_avg:659.37ms
+step:96/1750 train_loss:4.6337 train_time:56705ms step_avg:659.36ms
+step:97/1750 train_loss:4.7782 train_time:57363ms step_avg:659.35ms
+step:98/1750 train_loss:4.6192 train_time:58019ms step_avg:659.31ms
+step:99/1750 train_loss:4.6146 train_time:58677ms step_avg:659.29ms
+step:100/1750 train_loss:4.6541 train_time:59334ms step_avg:659.27ms
+step:101/1750 train_loss:4.5067 train_time:59991ms step_avg:659.25ms
+step:102/1750 train_loss:4.6816 train_time:60650ms step_avg:659.24ms
+step:103/1750 train_loss:4.5945 train_time:61306ms step_avg:659.21ms
+step:104/1750 train_loss:4.6786 train_time:61963ms step_avg:659.19ms
+step:105/1750 train_loss:4.6809 train_time:62620ms step_avg:659.16ms
+step:106/1750 train_loss:4.8442 train_time:63278ms step_avg:659.15ms
+step:107/1750 train_loss:4.6092 train_time:63935ms step_avg:659.12ms
+step:108/1750 train_loss:4.4468 train_time:64592ms step_avg:659.10ms
+step:109/1750 train_loss:4.8341 train_time:65249ms step_avg:659.08ms
+step:110/1750 train_loss:4.6231 train_time:65907ms step_avg:659.07ms
+step:111/1750 train_loss:4.5240 train_time:66562ms step_avg:659.03ms
+step:112/1750 train_loss:4.7608 train_time:67220ms step_avg:659.02ms
+step:113/1750 train_loss:4.4210 train_time:67878ms step_avg:659.01ms
+step:114/1750 train_loss:4.6074 train_time:68534ms step_avg:658.99ms
+step:115/1750 train_loss:4.5471 train_time:69190ms step_avg:658.96ms
+step:116/1750 train_loss:4.5884 train_time:69846ms step_avg:658.93ms
+step:117/1750 train_loss:4.3835 train_time:70504ms step_avg:658.92ms
+step:118/1750 train_loss:4.6027 train_time:71161ms step_avg:658.90ms
+step:119/1750 train_loss:4.4371 train_time:71818ms step_avg:658.88ms
+step:120/1750 train_loss:4.5356 train_time:72476ms step_avg:658.87ms
+step:121/1750 train_loss:4.5034 train_time:73132ms step_avg:658.84ms
+step:122/1750 train_loss:4.3975 train_time:73788ms step_avg:658.82ms
+step:123/1750 train_loss:4.4816 train_time:74445ms step_avg:658.80ms
+step:124/1750 train_loss:4.3482 train_time:75101ms step_avg:658.78ms
+step:125/1750 train_loss:4.3449 train_time:75758ms step_avg:658.76ms
+step:125/1750 val_loss:4.4634 train_time:75769ms step_avg:658.86ms
+============== Weight norms: ==============
+name = 'module._orig_mod.transformer.wte.weight' | l1_to_l2_norm = 959.04041 | frobenius_norm = 26587.80664 | spectral_norm = 6844.96484 | nuclear_norm = 640763.75000
+name = 'module._orig_mod.transformer.h.0.attn.c_q.weight' | l1_to_l2_norm = 1.29666 | frobenius_norm = 35.94736 | spectral_norm = 3.28059 | nuclear_norm = 843.94458
+name = 'module._orig_mod.transformer.h.0.attn.c_k.weight' | l1_to_l2_norm = 1.25406 | frobenius_norm = 34.76774 | spectral_norm = 4.11472 | nuclear_norm = 812.24689
+name = 'module._orig_mod.transformer.h.0.attn.c_v.weight' | l1_to_l2_norm = 1.61930 | frobenius_norm = 44.92015 | spectral_norm = 3.49810 | nuclear_norm = 991.39185
+name = 'module._orig_mod.transformer.h.0.attn.c_proj.weight' | l1_to_l2_norm = 1.36165 | frobenius_norm = 37.76598 | spectral_norm = 2.95021 | nuclear_norm = 884.74072
+name = 'module._orig_mod.transformer.h.0.mlp.c_fc.weight' | l1_to_l2_norm = 2.41360 | frobenius_norm = 66.89645 | spectral_norm = 5.75490 | nuclear_norm = 1774.71936
+name = 'module._orig_mod.transformer.h.0.mlp.c_proj.weight' | l1_to_l2_norm = 0.68414 | frobenius_norm = 38.52472 | spectral_norm = 2.84406 | nuclear_norm = 1021.57269
+name = 'module._orig_mod.transformer.h.1.attn.c_q.weight' | l1_to_l2_norm = 1.22448 | frobenius_norm = 33.94619 | spectral_norm = 2.98557 | nuclear_norm = 793.24036
+name = 'module._orig_mod.transformer.h.1.attn.c_k.weight' | l1_to_l2_norm = 1.21998 | frobenius_norm = 33.82322 | spectral_norm = 3.48870 | nuclear_norm = 788.77277
+name = 'module._orig_mod.transformer.h.1.attn.c_v.weight' | l1_to_l2_norm = 1.38975 | frobenius_norm = 38.54856 | spectral_norm = 3.43105 | nuclear_norm = 848.70459
+name = 'module._orig_mod.transformer.h.1.attn.c_proj.weight' | l1_to_l2_norm = 1.41614 | frobenius_norm = 39.30214 | spectral_norm = 3.04082 | nuclear_norm = 914.40863
+name = 'module._orig_mod.transformer.h.1.mlp.c_fc.weight' | l1_to_l2_norm = 2.66364 | frobenius_norm = 73.83128 | spectral_norm = 5.58768 | nuclear_norm = 1961.22461
+name = 'module._orig_mod.transformer.h.1.mlp.c_proj.weight' | l1_to_l2_norm = 0.73176 | frobenius_norm = 41.53403 | spectral_norm = 2.86147 | nuclear_norm = 1102.32043
+name = 'module._orig_mod.transformer.h.2.attn.c_q.weight' | l1_to_l2_norm = 1.20242 | frobenius_norm = 33.33776 | spectral_norm = 2.97146 | nuclear_norm = 772.93768
+name = 'module._orig_mod.transformer.h.2.attn.c_k.weight' | l1_to_l2_norm = 1.19438 | frobenius_norm = 33.11244 | spectral_norm = 3.06524 | nuclear_norm = 766.86945
+name = 'module._orig_mod.transformer.h.2.attn.c_v.weight' | l1_to_l2_norm = 1.42287 | frobenius_norm = 39.47033 | spectral_norm = 3.60804 | nuclear_norm = 859.67236
+name = 'module._orig_mod.transformer.h.2.attn.c_proj.weight' | l1_to_l2_norm = 1.46430 | frobenius_norm = 40.78514 | spectral_norm = 3.08350 | nuclear_norm = 943.83673
+name = 'module._orig_mod.transformer.h.2.mlp.c_fc.weight' | l1_to_l2_norm = 2.75329 | frobenius_norm = 76.32166 | spectral_norm = 5.49852 | nuclear_norm = 2026.34998
+name = 'module._orig_mod.transformer.h.2.mlp.c_proj.weight' | l1_to_l2_norm = 0.73975 | frobenius_norm = 42.28746 | spectral_norm = 2.86814 | nuclear_norm = 1120.61206
+name = 'module._orig_mod.transformer.h.3.attn.c_q.weight' | l1_to_l2_norm = 1.18905 | frobenius_norm = 32.96680 | spectral_norm = 2.96824 | nuclear_norm = 761.67291
+name = 'module._orig_mod.transformer.h.3.attn.c_k.weight' | l1_to_l2_norm = 1.19696 | frobenius_norm = 33.18578 | spectral_norm = 3.20811 | nuclear_norm = 767.91199
+name = 'module._orig_mod.transformer.h.3.attn.c_v.weight' | l1_to_l2_norm = 1.38270 | frobenius_norm = 38.36636 | spectral_norm = 3.53952 | nuclear_norm = 825.78113
+name = 'module._orig_mod.transformer.h.3.attn.c_proj.weight' | l1_to_l2_norm = 1.37404 | frobenius_norm = 38.26228 | spectral_norm = 3.21424 | nuclear_norm = 850.47742
+name = 'module._orig_mod.transformer.h.3.mlp.c_fc.weight' | l1_to_l2_norm = 2.86908 | frobenius_norm = 79.53732 | spectral_norm = 5.40075 | nuclear_norm = 2110.21265
+name = 'module._orig_mod.transformer.h.3.mlp.c_proj.weight' | l1_to_l2_norm = 0.74294 | frobenius_norm = 42.67783 | spectral_norm = 3.03795 | nuclear_norm = 1129.35461
+name = 'module._orig_mod.transformer.h.4.attn.c_q.weight' | l1_to_l2_norm = 1.15733 | frobenius_norm = 32.08701 | spectral_norm = 2.97088 | nuclear_norm = 741.17224
+name = 'module._orig_mod.transformer.h.4.attn.c_k.weight' | l1_to_l2_norm = 1.17053 | frobenius_norm = 32.45279 | spectral_norm = 3.07761 | nuclear_norm = 748.85107
+name = 'module._orig_mod.transformer.h.4.attn.c_v.weight' | l1_to_l2_norm = 1.40839 | frobenius_norm = 39.08013 | spectral_norm = 3.56806 | nuclear_norm = 844.79004
+name = 'module._orig_mod.transformer.h.4.attn.c_proj.weight' | l1_to_l2_norm = 1.44804 | frobenius_norm = 40.39602 | spectral_norm = 3.17177 | nuclear_norm = 914.43823
+name = 'module._orig_mod.transformer.h.4.mlp.c_fc.weight' | l1_to_l2_norm = 2.82230 | frobenius_norm = 78.24207 | spectral_norm = 5.39852 | nuclear_norm = 2072.07397
+name = 'module._orig_mod.transformer.h.4.mlp.c_proj.weight' | l1_to_l2_norm = 0.72048 | frobenius_norm = 41.72840 | spectral_norm = 2.83212 | nuclear_norm = 1103.19263
+name = 'module._orig_mod.transformer.h.5.attn.c_q.weight' | l1_to_l2_norm = 1.15134 | frobenius_norm = 31.92391 | spectral_norm = 2.97659 | nuclear_norm = 731.39343
+name = 'module._orig_mod.transformer.h.5.attn.c_k.weight' | l1_to_l2_norm = 1.18352 | frobenius_norm = 32.81564 | spectral_norm = 2.83702 | nuclear_norm = 752.86737
+name = 'module._orig_mod.transformer.h.5.attn.c_v.weight' | l1_to_l2_norm = 1.41761 | frobenius_norm = 39.35141 | spectral_norm = 3.64972 | nuclear_norm = 848.12213
+name = 'module._orig_mod.transformer.h.5.attn.c_proj.weight' | l1_to_l2_norm = 1.45971 | frobenius_norm = 40.83598 | spectral_norm = 3.22989 | nuclear_norm = 932.25830
+name = 'module._orig_mod.transformer.h.5.mlp.c_fc.weight' | l1_to_l2_norm = 2.77989 | frobenius_norm = 77.06867 | spectral_norm = 5.50257 | nuclear_norm = 2038.46729
+name = 'module._orig_mod.transformer.h.5.mlp.c_proj.weight' | l1_to_l2_norm = 0.70005 | frobenius_norm = 40.67612 | spectral_norm = 2.76682 | nuclear_norm = 1073.65894
+name = 'module._orig_mod.transformer.h.6.attn.c_q.weight' | l1_to_l2_norm = 1.12499 | frobenius_norm = 31.19661 | spectral_norm = 2.90279 | nuclear_norm = 712.86194
+name = 'module._orig_mod.transformer.h.6.attn.c_k.weight' | l1_to_l2_norm = 1.14353 | frobenius_norm = 31.70919 | spectral_norm = 2.88743 | nuclear_norm = 724.35449
+name = 'module._orig_mod.transformer.h.6.attn.c_v.weight' | l1_to_l2_norm = 1.25285 | frobenius_norm = 34.76032 | spectral_norm = 3.14350 | nuclear_norm = 768.79211
+name = 'module._orig_mod.transformer.h.6.attn.c_proj.weight' | l1_to_l2_norm = 1.51169 | frobenius_norm = 42.10454 | spectral_norm = 3.42737 | nuclear_norm = 966.51288
+name = 'module._orig_mod.transformer.h.6.mlp.c_fc.weight' | l1_to_l2_norm = 2.76982 | frobenius_norm = 76.79604 | spectral_norm = 5.47553 | nuclear_norm = 2027.21179
+name = 'module._orig_mod.transformer.h.6.mlp.c_proj.weight' | l1_to_l2_norm = 0.68925 | frobenius_norm = 40.50637 | spectral_norm = 2.82523 | nuclear_norm = 1064.47778
+name = 'module._orig_mod.transformer.h.7.attn.c_q.weight' | l1_to_l2_norm = 1.13588 | frobenius_norm = 31.50156 | spectral_norm = 3.03612 | nuclear_norm = 717.59058
+name = 'module._orig_mod.transformer.h.7.attn.c_k.weight' | l1_to_l2_norm = 1.17358 | frobenius_norm = 32.54087 | spectral_norm = 2.87033 | nuclear_norm = 743.30652
+name = 'module._orig_mod.transformer.h.7.attn.c_v.weight' | l1_to_l2_norm = 1.40237 | frobenius_norm = 38.94036 | spectral_norm = 3.80365 | nuclear_norm = 831.89954
+name = 'module._orig_mod.transformer.h.7.attn.c_proj.weight' | l1_to_l2_norm = 1.49096 | frobenius_norm = 41.52470 | spectral_norm = 3.48425 | nuclear_norm = 944.01581
+name = 'module._orig_mod.transformer.h.7.mlp.c_fc.weight' | l1_to_l2_norm = 2.81024 | frobenius_norm = 77.92459 | spectral_norm = 5.67335 | nuclear_norm = 2054.53125
+name = 'module._orig_mod.transformer.h.7.mlp.c_proj.weight' | l1_to_l2_norm = 0.69209 | frobenius_norm = 40.75888 | spectral_norm = 2.87388 | nuclear_norm = 1070.36951
+name = 'module._orig_mod.transformer.h.8.attn.c_q.weight' | l1_to_l2_norm = 1.15273 | frobenius_norm = 31.96805 | spectral_norm = 2.96199 | nuclear_norm = 729.35516
+name = 'module._orig_mod.transformer.h.8.attn.c_k.weight' | l1_to_l2_norm = 1.18531 | frobenius_norm = 32.86760 | spectral_norm = 2.91408 | nuclear_norm = 750.68994
+name = 'module._orig_mod.transformer.h.8.attn.c_v.weight' | l1_to_l2_norm = 1.45886 | frobenius_norm = 40.50718 | spectral_norm = 3.92286 | nuclear_norm = 874.24219
+name = 'module._orig_mod.transformer.h.8.attn.c_proj.weight' | l1_to_l2_norm = 1.57633 | frobenius_norm = 43.95337 | spectral_norm = 3.44963 | nuclear_norm = 1018.26276
+name = 'module._orig_mod.transformer.h.8.mlp.c_fc.weight' | l1_to_l2_norm = 2.85088 | frobenius_norm = 79.05350 | spectral_norm = 5.75640 | nuclear_norm = 2084.73901
+name = 'module._orig_mod.transformer.h.8.mlp.c_proj.weight' | l1_to_l2_norm = 0.69101 | frobenius_norm = 40.69795 | spectral_norm = 2.86021 | nuclear_norm = 1068.03284
+name = 'module._orig_mod.transformer.h.9.attn.c_q.weight' | l1_to_l2_norm = 1.16198 | frobenius_norm = 32.22219 | spectral_norm = 3.01919 | nuclear_norm = 735.17255
+name = 'module._orig_mod.transformer.h.9.attn.c_k.weight' | l1_to_l2_norm = 1.18651 | frobenius_norm = 32.90345 | spectral_norm = 2.97744 | nuclear_norm = 750.46466
+name = 'module._orig_mod.transformer.h.9.attn.c_v.weight' | l1_to_l2_norm = 1.44608 | frobenius_norm = 40.14512 | spectral_norm = 3.76693 | nuclear_norm = 866.72101
+name = 'module._orig_mod.transformer.h.9.attn.c_proj.weight' | l1_to_l2_norm = 1.56062 | frobenius_norm = 43.43179 | spectral_norm = 3.42899 | nuclear_norm = 1003.39740
+name = 'module._orig_mod.transformer.h.9.mlp.c_fc.weight' | l1_to_l2_norm = 2.80798 | frobenius_norm = 77.86366 | spectral_norm = 5.70884 | nuclear_norm = 2052.37207
+name = 'module._orig_mod.transformer.h.9.mlp.c_proj.weight' | l1_to_l2_norm = 0.67825 | frobenius_norm = 40.07989 | spectral_norm = 2.86668 | nuclear_norm = 1049.36938
+name = 'module._orig_mod.transformer.h.10.attn.c_q.weight' | l1_to_l2_norm = 1.13932 | frobenius_norm = 31.59646 | spectral_norm = 2.94916 | nuclear_norm = 717.85376
+name = 'module._orig_mod.transformer.h.10.attn.c_k.weight' | l1_to_l2_norm = 1.15723 | frobenius_norm = 32.09307 | spectral_norm = 2.97505 | nuclear_norm = 727.95886
+name = 'module._orig_mod.transformer.h.10.attn.c_v.weight' | l1_to_l2_norm = 1.44441 | frobenius_norm = 40.09123 | spectral_norm = 3.67542 | nuclear_norm = 867.13782
+name = 'module._orig_mod.transformer.h.10.attn.c_proj.weight' | l1_to_l2_norm = 1.57258 | frobenius_norm = 43.88029 | spectral_norm = 3.49637 | nuclear_norm = 1011.89478
+name = 'module._orig_mod.transformer.h.10.mlp.c_fc.weight' | l1_to_l2_norm = 2.77837 | frobenius_norm = 77.04127 | spectral_norm = 5.86180 | nuclear_norm = 2033.40967
+name = 'module._orig_mod.transformer.h.10.mlp.c_proj.weight' | l1_to_l2_norm = 0.67132 | frobenius_norm = 39.43971 | spectral_norm = 2.87308 | nuclear_norm = 1033.01331
+name = 'module._orig_mod.transformer.h.11.attn.c_q.weight' | l1_to_l2_norm = 1.14267 | frobenius_norm = 31.68912 | spectral_norm = 2.95844 | nuclear_norm = 723.16016
+name = 'module._orig_mod.transformer.h.11.attn.c_k.weight' | l1_to_l2_norm = 1.15955 | frobenius_norm = 32.15878 | spectral_norm = 3.07675 | nuclear_norm = 730.88123
+name = 'module._orig_mod.transformer.h.11.attn.c_v.weight' | l1_to_l2_norm = 1.40845 | frobenius_norm = 39.08316 | spectral_norm = 3.45035 | nuclear_norm = 848.81140
+name = 'module._orig_mod.transformer.h.11.attn.c_proj.weight' | l1_to_l2_norm = 1.52504 | frobenius_norm = 42.76130 | spectral_norm = 3.15680 | nuclear_norm = 985.71045
+name = 'module._orig_mod.transformer.h.11.mlp.c_fc.weight' | l1_to_l2_norm = 2.67849 | frobenius_norm = 74.27333 | spectral_norm = 5.90468 | nuclear_norm = 1961.09497
+name = 'module._orig_mod.transformer.h.11.mlp.c_proj.weight' | l1_to_l2_norm = 0.65490 | frobenius_norm = 38.12126 | spectral_norm = 2.79989 | nuclear_norm = 997.16223
+name = 'module._orig_mod.lm_head.weight' | l1_to_l2_norm = 13.75735 | frobenius_norm = 381.60376 | spectral_norm = 132.05737 | nuclear_norm = 9040.20703
+===========================================
+step:126/1750 train_loss:4.3199 train_time:76408ms step_avg:658.69ms
+step:127/1750 train_loss:4.5182 train_time:77062ms step_avg:658.65ms
+step:128/1750 train_loss:4.4960 train_time:77715ms step_avg:658.60ms
+step:129/1750 train_loss:4.5059 train_time:78369ms step_avg:658.56ms
+step:130/1750 train_loss:4.4667 train_time:79023ms step_avg:658.52ms
+step:131/1750 train_loss:4.5909 train_time:79698ms step_avg:658.67ms
+step:132/1750 train_loss:4.3519 train_time:80375ms step_avg:658.81ms
+step:133/1750 train_loss:4.3250 train_time:81051ms step_avg:658.95ms
+step:134/1750 train_loss:4.4667 train_time:81725ms step_avg:659.07ms
+step:135/1750 train_loss:4.3030 train_time:82401ms step_avg:659.21ms
+step:136/1750 train_loss:4.3109 train_time:83079ms step_avg:659.36ms
+step:137/1750 train_loss:4.3815 train_time:83754ms step_avg:659.48ms
+step:138/1750 train_loss:4.3934 train_time:84430ms step_avg:659.61ms
+step:139/1750 train_loss:4.4904 train_time:85106ms step_avg:659.74ms
+step:140/1750 train_loss:4.3673 train_time:85782ms step_avg:659.86ms
+step:141/1750 train_loss:4.2625 train_time:86460ms step_avg:660.00ms
+step:142/1750 train_loss:4.3970 train_time:87136ms step_avg:660.12ms
+step:143/1750 train_loss:4.4788 train_time:87814ms step_avg:660.25ms
+step:144/1750 train_loss:4.5506 train_time:88491ms step_avg:660.38ms
+step:145/1750 train_loss:4.3197 train_time:89167ms step_avg:660.50ms
+step:146/1750 train_loss:4.3600 train_time:89844ms step_avg:660.61ms
+step:147/1750 train_loss:4.3921 train_time:90521ms step_avg:660.73ms
+step:148/1750 train_loss:4.1849 train_time:91196ms step_avg:660.84ms
+step:149/1750 train_loss:4.3570 train_time:91871ms step_avg:660.94ms
+step:150/1750 train_loss:4.3095 train_time:92547ms step_avg:661.05ms
+step:151/1750 train_loss:4.3031 train_time:93222ms step_avg:661.15ms
+step:152/1750 train_loss:4.1900 train_time:93899ms step_avg:661.26ms
+step:153/1750 train_loss:4.3894 train_time:94575ms step_avg:661.36ms
+step:154/1750 train_loss:4.1987 train_time:95251ms step_avg:661.47ms
+step:155/1750 train_loss:4.1714 train_time:95927ms step_avg:661.57ms
+step:156/1750 train_loss:4.3221 train_time:96604ms step_avg:661.67ms
+step:157/1750 train_loss:4.3905 train_time:97281ms step_avg:661.77ms
+step:158/1750 train_loss:4.2838 train_time:97957ms step_avg:661.87ms
+step:159/1750 train_loss:4.2397 train_time:98633ms step_avg:661.97ms
+step:160/1750 train_loss:4.1893 train_time:99312ms step_avg:662.08ms
+step:161/1750 train_loss:4.2513 train_time:99987ms step_avg:662.17ms
+step:162/1750 train_loss:4.2689 train_time:100664ms step_avg:662.26ms
+step:163/1750 train_loss:4.2322 train_time:101341ms step_avg:662.36ms
+step:164/1750 train_loss:4.1720 train_time:102018ms step_avg:662.45ms
+step:165/1750 train_loss:4.2489 train_time:102694ms step_avg:662.54ms
+step:166/1750 train_loss:4.3850 train_time:103371ms step_avg:662.64ms
+step:167/1750 train_loss:4.3103 train_time:104047ms step_avg:662.72ms
+step:168/1750 train_loss:4.2329 train_time:104724ms step_avg:662.81ms
+step:169/1750 train_loss:4.2676 train_time:105400ms step_avg:662.89ms
+step:170/1750 train_loss:4.3173 train_time:106077ms step_avg:662.98ms
+step:171/1750 train_loss:3.8050 train_time:106754ms step_avg:663.07ms
+step:172/1750 train_loss:4.1581 train_time:107432ms step_avg:663.16ms
+step:173/1750 train_loss:4.1706 train_time:108109ms step_avg:663.24ms
+step:174/1750 train_loss:4.3695 train_time:108785ms step_avg:663.32ms
+step:175/1750 train_loss:4.1985 train_time:109461ms step_avg:663.40ms
+step:176/1750 train_loss:4.2485 train_time:110140ms step_avg:663.49ms
+step:177/1750 train_loss:4.4066 train_time:110816ms step_avg:663.57ms
+step:178/1750 train_loss:4.2606 train_time:111492ms step_avg:663.64ms
+step:179/1750 train_loss:4.1991 train_time:112169ms step_avg:663.72ms
+step:180/1750 train_loss:4.2454 train_time:112845ms step_avg:663.80ms
+step:181/1750 train_loss:4.1349 train_time:113522ms step_avg:663.87ms
+step:182/1750 train_loss:4.1840 train_time:114198ms step_avg:663.94ms
+step:183/1750 train_loss:4.1561 train_time:114875ms step_avg:664.02ms
+step:184/1750 train_loss:4.3022 train_time:115551ms step_avg:664.09ms
+step:185/1750 train_loss:4.1987 train_time:116228ms step_avg:664.16ms
+step:186/1750 train_loss:4.3020 train_time:116906ms step_avg:664.24ms
+step:187/1750 train_loss:4.2066 train_time:117582ms step_avg:664.30ms
+step:188/1750 train_loss:4.1877 train_time:118259ms step_avg:664.38ms
+step:189/1750 train_loss:4.0159 train_time:118936ms step_avg:664.44ms
+step:190/1750 train_loss:4.1386 train_time:119826ms step_avg:665.70ms
+step:191/1750 train_loss:4.1194 train_time:120505ms step_avg:665.78ms
+step:192/1750 train_loss:4.0679 train_time:121182ms step_avg:665.84ms
+step:193/1750 train_loss:4.2931 train_time:121860ms step_avg:665.90ms
+step:194/1750 train_loss:4.2087 train_time:122538ms step_avg:665.97ms
+step:195/1750 train_loss:4.3972 train_time:123213ms step_avg:666.02ms
+step:196/1750 train_loss:4.2212 train_time:123887ms step_avg:666.06ms
+step:197/1750 train_loss:4.0763 train_time:124560ms step_avg:666.10ms
+step:198/1750 train_loss:4.1922 train_time:125233ms step_avg:666.13ms
+step:199/1750 train_loss:4.0507 train_time:125906ms step_avg:666.17ms
+step:200/1750 train_loss:4.1457 train_time:126578ms step_avg:666.20ms
+step:201/1750 train_loss:4.0332 train_time:127251ms step_avg:666.24ms
+step:202/1750 train_loss:4.2806 train_time:127924ms step_avg:666.27ms
+step:203/1750 train_loss:4.0890 train_time:128595ms step_avg:666.30ms
+step:204/1750 train_loss:4.2168 train_time:129267ms step_avg:666.33ms
+step:205/1750 train_loss:4.2695 train_time:129940ms step_avg:666.36ms
+step:206/1750 train_loss:3.9665 train_time:130613ms step_avg:666.39ms
+step:207/1750 train_loss:4.1125 train_time:131285ms step_avg:666.42ms
+step:208/1750 train_loss:4.1219 train_time:131958ms step_avg:666.46ms
+step:209/1750 train_loss:4.2565 train_time:132631ms step_avg:666.49ms
+step:210/1750 train_loss:4.1996 train_time:133304ms step_avg:666.52ms
+step:211/1750 train_loss:4.0734 train_time:133977ms step_avg:666.55ms
+step:212/1750 train_loss:4.1393 train_time:134651ms step_avg:666.59ms
+step:213/1750 train_loss:4.0728 train_time:135322ms step_avg:666.61ms
+step:214/1750 train_loss:4.1296 train_time:135995ms step_avg:666.64ms
+step:215/1750 train_loss:3.9737 train_time:136668ms step_avg:666.67ms
+step:216/1750 train_loss:4.0175 train_time:137340ms step_avg:666.70ms
+step:217/1750 train_loss:4.0226 train_time:138011ms step_avg:666.72ms
+step:218/1750 train_loss:4.1072 train_time:138684ms step_avg:666.75ms
+step:219/1750 train_loss:4.0968 train_time:139356ms step_avg:666.77ms
+step:220/1750 train_loss:4.1018 train_time:140029ms step_avg:666.80ms
+step:221/1750 train_loss:4.1143 train_time:140701ms step_avg:666.83ms
+step:222/1750 train_loss:4.0172 train_time:141374ms step_avg:666.86ms
+step:223/1750 train_loss:4.0166 train_time:142047ms step_avg:666.89ms
+step:224/1750 train_loss:4.3258 train_time:142719ms step_avg:666.91ms
+step:225/1750 train_loss:3.9372 train_time:143391ms step_avg:666.94ms
+step:226/1750 train_loss:4.0128 train_time:144063ms step_avg:666.96ms
+step:227/1750 train_loss:4.0165 train_time:144734ms step_avg:666.98ms
+step:228/1750 train_loss:4.1731 train_time:145406ms step_avg:667.00ms
+step:229/1750 train_loss:3.9529 train_time:146080ms step_avg:667.03ms
+step:230/1750 train_loss:4.0727 train_time:146751ms step_avg:667.05ms
+step:231/1750 train_loss:3.9332 train_time:147423ms step_avg:667.07ms
+step:232/1750 train_loss:4.0031 train_time:148094ms step_avg:667.09ms
+step:233/1750 train_loss:4.1228 train_time:148766ms step_avg:667.11ms
+step:234/1750 train_loss:4.0543 train_time:149438ms step_avg:667.13ms
+step:235/1750 train_loss:3.9366 train_time:150109ms step_avg:667.15ms
+step:236/1750 train_loss:4.1172 train_time:150780ms step_avg:667.17ms
+step:237/1750 train_loss:4.1112 train_time:151450ms step_avg:667.18ms
+step:238/1750 train_loss:3.9690 train_time:152123ms step_avg:667.20ms
+step:239/1750 train_loss:4.0974 train_time:152794ms step_avg:667.22ms
+step:240/1750 train_loss:4.1444 train_time:153465ms step_avg:667.24ms
+step:241/1750 train_loss:3.9956 train_time:154137ms step_avg:667.26ms
+step:242/1750 train_loss:4.1775 train_time:154809ms step_avg:667.28ms
+step:243/1750 train_loss:4.0514 train_time:155481ms step_avg:667.30ms
+step:244/1750 train_loss:4.1277 train_time:156152ms step_avg:667.32ms
+step:245/1750 train_loss:4.1748 train_time:156823ms step_avg:667.33ms
+step:246/1750 train_loss:4.0843 train_time:157496ms step_avg:667.36ms
+step:247/1750 train_loss:4.0364 train_time:158169ms step_avg:667.38ms
+step:248/1750 train_loss:4.1419 train_time:158840ms step_avg:667.39ms
+step:249/1750 train_loss:3.9485 train_time:159511ms step_avg:667.41ms
+step:250/1750 train_loss:3.9983 train_time:160183ms step_avg:667.43ms
+step:250/1750 val_loss:4.0319 train_time:160194ms step_avg:667.48ms
+============== Weight norms: ==============
+name = 'module._orig_mod.transformer.wte.weight' | l1_to_l2_norm = 1283.31641 | frobenius_norm = 35575.21094 | spectral_norm = 7593.56836 | nuclear_norm = 868134.18750
+name = 'module._orig_mod.transformer.h.0.attn.c_q.weight' | l1_to_l2_norm = 2.06399 | frobenius_norm = 57.22160 | spectral_norm = 5.97942 | nuclear_norm = 1339.40698
+name = 'module._orig_mod.transformer.h.0.attn.c_k.weight' | l1_to_l2_norm = 2.00847 | frobenius_norm = 55.68378 | spectral_norm = 7.74304 | nuclear_norm = 1295.35266
+name = 'module._orig_mod.transformer.h.0.attn.c_v.weight' | l1_to_l2_norm = 2.65915 | frobenius_norm = 73.74769 | spectral_norm = 5.07089 | nuclear_norm = 1695.72949
+name = 'module._orig_mod.transformer.h.0.attn.c_proj.weight' | l1_to_l2_norm = 2.11464 | frobenius_norm = 58.65306 | spectral_norm = 4.86383 | nuclear_norm = 1380.11475
+name = 'module._orig_mod.transformer.h.0.mlp.c_fc.weight' | l1_to_l2_norm = 3.99829 | frobenius_norm = 110.81985 | spectral_norm = 9.28290 | nuclear_norm = 2945.41064
+name = 'module._orig_mod.transformer.h.0.mlp.c_proj.weight' | l1_to_l2_norm = 1.07151 | frobenius_norm = 59.83870 | spectral_norm = 4.71781 | nuclear_norm = 1588.13257
+name = 'module._orig_mod.transformer.h.1.attn.c_q.weight' | l1_to_l2_norm = 1.99468 | frobenius_norm = 55.29958 | spectral_norm = 5.04571 | nuclear_norm = 1290.96069
+name = 'module._orig_mod.transformer.h.1.attn.c_k.weight' | l1_to_l2_norm = 1.96912 | frobenius_norm = 54.59351 | spectral_norm = 5.67318 | nuclear_norm = 1272.42078
+name = 'module._orig_mod.transformer.h.1.attn.c_v.weight' | l1_to_l2_norm = 2.16317 | frobenius_norm = 59.99348 | spectral_norm = 5.27897 | nuclear_norm = 1351.61890
+name = 'module._orig_mod.transformer.h.1.attn.c_proj.weight' | l1_to_l2_norm = 2.21571 | frobenius_norm = 61.50073 | spectral_norm = 4.88541 | nuclear_norm = 1442.68738
+name = 'module._orig_mod.transformer.h.1.mlp.c_fc.weight' | l1_to_l2_norm = 4.26603 | frobenius_norm = 118.24274 | spectral_norm = 8.48116 | nuclear_norm = 3154.23145
+name = 'module._orig_mod.transformer.h.1.mlp.c_proj.weight' | l1_to_l2_norm = 1.11349 | frobenius_norm = 62.56916 | spectral_norm = 4.93211 | nuclear_norm = 1659.04028
+name = 'module._orig_mod.transformer.h.2.attn.c_q.weight' | l1_to_l2_norm = 1.97595 | frobenius_norm = 54.78446 | spectral_norm = 4.88950 | nuclear_norm = 1267.11694
+name = 'module._orig_mod.transformer.h.2.attn.c_k.weight' | l1_to_l2_norm = 1.96071 | frobenius_norm = 54.35914 | spectral_norm = 4.87298 | nuclear_norm = 1257.47119
+name = 'module._orig_mod.transformer.h.2.attn.c_v.weight' | l1_to_l2_norm = 2.24300 | frobenius_norm = 62.21540 | spectral_norm = 5.62163 | nuclear_norm = 1381.86108
+name = 'module._orig_mod.transformer.h.2.attn.c_proj.weight' | l1_to_l2_norm = 2.32777 | frobenius_norm = 64.75492 | spectral_norm = 5.18302 | nuclear_norm = 1518.30627
+name = 'module._orig_mod.transformer.h.2.mlp.c_fc.weight' | l1_to_l2_norm = 4.38189 | frobenius_norm = 121.45995 | spectral_norm = 8.72695 | nuclear_norm = 3239.19409
+name = 'module._orig_mod.transformer.h.2.mlp.c_proj.weight' | l1_to_l2_norm = 1.12085 | frobenius_norm = 63.29340 | spectral_norm = 4.83449 | nuclear_norm = 1675.98303
+name = 'module._orig_mod.transformer.h.3.attn.c_q.weight' | l1_to_l2_norm = 1.95756 | frobenius_norm = 54.27460 | spectral_norm = 5.10823 | nuclear_norm = 1258.25415
+name = 'module._orig_mod.transformer.h.3.attn.c_k.weight' | l1_to_l2_norm = 1.94204 | frobenius_norm = 53.84137 | spectral_norm = 5.28044 | nuclear_norm = 1250.15833
+name = 'module._orig_mod.transformer.h.3.attn.c_v.weight' | l1_to_l2_norm = 2.20040 | frobenius_norm = 61.04965 | spectral_norm = 5.40852 | nuclear_norm = 1326.52905
+name = 'module._orig_mod.transformer.h.3.attn.c_proj.weight' | l1_to_l2_norm = 2.23324 | frobenius_norm = 62.15975 | spectral_norm = 5.22981 | nuclear_norm = 1408.88269
+name = 'module._orig_mod.transformer.h.3.mlp.c_fc.weight' | l1_to_l2_norm = 4.59785 | frobenius_norm = 127.45748 | spectral_norm = 8.46427 | nuclear_norm = 3394.57617
+name = 'module._orig_mod.transformer.h.3.mlp.c_proj.weight' | l1_to_l2_norm = 1.13198 | frobenius_norm = 64.24031 | spectral_norm = 5.23957 | nuclear_norm = 1696.12231
+name = 'module._orig_mod.transformer.h.4.attn.c_q.weight' | l1_to_l2_norm = 1.91852 | frobenius_norm = 53.19313 | spectral_norm = 5.12582 | nuclear_norm = 1232.47961
+name = 'module._orig_mod.transformer.h.4.attn.c_k.weight' | l1_to_l2_norm = 1.91089 | frobenius_norm = 52.98292 | spectral_norm = 5.03216 | nuclear_norm = 1229.70471
+name = 'module._orig_mod.transformer.h.4.attn.c_v.weight' | l1_to_l2_norm = 2.24686 | frobenius_norm = 62.33591 | spectral_norm = 5.38591 | nuclear_norm = 1363.39368
+name = 'module._orig_mod.transformer.h.4.attn.c_proj.weight' | l1_to_l2_norm = 2.31870 | frobenius_norm = 64.77364 | spectral_norm = 5.02181 | nuclear_norm = 1476.13330
+name = 'module._orig_mod.transformer.h.4.mlp.c_fc.weight' | l1_to_l2_norm = 4.55952 | frobenius_norm = 126.39729 | spectral_norm = 9.05588 | nuclear_norm = 3361.34717
+name = 'module._orig_mod.transformer.h.4.mlp.c_proj.weight' | l1_to_l2_norm = 1.11154 | frobenius_norm = 63.24070 | spectral_norm = 4.82150 | nuclear_norm = 1671.86011
+name = 'module._orig_mod.transformer.h.5.attn.c_q.weight' | l1_to_l2_norm = 1.93509 | frobenius_norm = 53.65339 | spectral_norm = 4.91383 | nuclear_norm = 1227.88525
+name = 'module._orig_mod.transformer.h.5.attn.c_k.weight' | l1_to_l2_norm = 1.95537 | frobenius_norm = 54.21201 | spectral_norm = 4.60286 | nuclear_norm = 1244.20874
+name = 'module._orig_mod.transformer.h.5.attn.c_v.weight' | l1_to_l2_norm = 2.27389 | frobenius_norm = 63.10365 | spectral_norm = 5.63820 | nuclear_norm = 1377.14502
+name = 'module._orig_mod.transformer.h.5.attn.c_proj.weight' | l1_to_l2_norm = 2.38998 | frobenius_norm = 66.93221 | spectral_norm = 5.13254 | nuclear_norm = 1553.61780
+name = 'module._orig_mod.transformer.h.5.mlp.c_fc.weight' | l1_to_l2_norm = 4.59170 | frobenius_norm = 127.28669 | spectral_norm = 8.31837 | nuclear_norm = 3390.55933
+name = 'module._orig_mod.transformer.h.5.mlp.c_proj.weight' | l1_to_l2_norm = 1.08661 | frobenius_norm = 61.69604 | spectral_norm = 4.77275 | nuclear_norm = 1632.52625
+name = 'module._orig_mod.transformer.h.6.attn.c_q.weight' | l1_to_l2_norm = 1.96567 | frobenius_norm = 54.50352 | spectral_norm = 4.72740 | nuclear_norm = 1259.85730
+name = 'module._orig_mod.transformer.h.6.attn.c_k.weight' | l1_to_l2_norm = 1.93757 | frobenius_norm = 53.72549 | spectral_norm = 5.06210 | nuclear_norm = 1241.20801
+name = 'module._orig_mod.transformer.h.6.attn.c_v.weight' | l1_to_l2_norm = 1.98043 | frobenius_norm = 54.93380 | spectral_norm = 4.83440 | nuclear_norm = 1226.90955
+name = 'module._orig_mod.transformer.h.6.attn.c_proj.weight' | l1_to_l2_norm = 2.36139 | frobenius_norm = 65.79283 | spectral_norm = 4.98957 | nuclear_norm = 1535.57886
+name = 'module._orig_mod.transformer.h.6.mlp.c_fc.weight' | l1_to_l2_norm = 4.48386 | frobenius_norm = 124.29960 | spectral_norm = 9.11837 | nuclear_norm = 3307.12793
+name = 'module._orig_mod.transformer.h.6.mlp.c_proj.weight' | l1_to_l2_norm = 1.09286 | frobenius_norm = 62.61522 | spectral_norm = 5.15135 | nuclear_norm = 1654.37622
+name = 'module._orig_mod.transformer.h.7.attn.c_q.weight' | l1_to_l2_norm = 1.92044 | frobenius_norm = 53.26054 | spectral_norm = 5.15675 | nuclear_norm = 1220.91272
+name = 'module._orig_mod.transformer.h.7.attn.c_k.weight' | l1_to_l2_norm = 1.92188 | frobenius_norm = 53.29117 | spectral_norm = 4.86049 | nuclear_norm = 1223.59131
+name = 'module._orig_mod.transformer.h.7.attn.c_v.weight' | l1_to_l2_norm = 2.30581 | frobenius_norm = 63.99293 | spectral_norm = 6.32144 | nuclear_norm = 1383.93018
+name = 'module._orig_mod.transformer.h.7.attn.c_proj.weight' | l1_to_l2_norm = 2.49276 | frobenius_norm = 69.30131 | spectral_norm = 5.68916 | nuclear_norm = 1607.99048
+name = 'module._orig_mod.transformer.h.7.mlp.c_fc.weight' | l1_to_l2_norm = 4.59589 | frobenius_norm = 127.41971 | spectral_norm = 9.36720 | nuclear_norm = 3383.95605
+name = 'module._orig_mod.transformer.h.7.mlp.c_proj.weight' | l1_to_l2_norm = 1.09944 | frobenius_norm = 63.28471 | spectral_norm = 5.15503 | nuclear_norm = 1671.51086
+name = 'module._orig_mod.transformer.h.8.attn.c_q.weight' | l1_to_l2_norm = 1.96556 | frobenius_norm = 54.50872 | spectral_norm = 4.87092 | nuclear_norm = 1254.34973
+name = 'module._orig_mod.transformer.h.8.attn.c_k.weight' | l1_to_l2_norm = 1.97164 | frobenius_norm = 54.67437 | spectral_norm = 4.78589 | nuclear_norm = 1256.43481
+name = 'module._orig_mod.transformer.h.8.attn.c_v.weight' | l1_to_l2_norm = 2.41117 | frobenius_norm = 66.93081 | spectral_norm = 6.31055 | nuclear_norm = 1467.70068
+name = 'module._orig_mod.transformer.h.8.attn.c_proj.weight' | l1_to_l2_norm = 2.59400 | frobenius_norm = 72.42820 | spectral_norm = 5.24779 | nuclear_norm = 1703.74158
+name = 'module._orig_mod.transformer.h.8.mlp.c_fc.weight' | l1_to_l2_norm = 4.59959 | frobenius_norm = 127.53684 | spectral_norm = 9.25747 | nuclear_norm = 3386.72070
+name = 'module._orig_mod.transformer.h.8.mlp.c_proj.weight' | l1_to_l2_norm = 1.09638 | frobenius_norm = 63.10401 | spectral_norm = 5.23675 | nuclear_norm = 1666.03735
+name = 'module._orig_mod.transformer.h.9.attn.c_q.weight' | l1_to_l2_norm = 1.97240 | frobenius_norm = 54.70229 | spectral_norm = 5.11363 | nuclear_norm = 1258.59790
+name = 'module._orig_mod.transformer.h.9.attn.c_k.weight' | l1_to_l2_norm = 1.96919 | frobenius_norm = 54.61021 | spectral_norm = 4.87691 | nuclear_norm = 1254.96082
+name = 'module._orig_mod.transformer.h.9.attn.c_v.weight' | l1_to_l2_norm = 2.36452 | frobenius_norm = 65.62577 | spectral_norm = 5.99029 | nuclear_norm = 1443.80676
+name = 'module._orig_mod.transformer.h.9.attn.c_proj.weight' | l1_to_l2_norm = 2.57267 | frobenius_norm = 71.61642 | spectral_norm = 5.22527 | nuclear_norm = 1685.55713
+name = 'module._orig_mod.transformer.h.9.mlp.c_fc.weight' | l1_to_l2_norm = 4.59524 | frobenius_norm = 127.42470 | spectral_norm = 8.99824 | nuclear_norm = 3382.10645
+name = 'module._orig_mod.transformer.h.9.mlp.c_proj.weight' | l1_to_l2_norm = 1.09343 | frobenius_norm = 63.02365 | spectral_norm = 5.33054 | nuclear_norm = 1662.91833
+name = 'module._orig_mod.transformer.h.10.attn.c_q.weight' | l1_to_l2_norm = 1.96529 | frobenius_norm = 54.51210 | spectral_norm = 5.01358 | nuclear_norm = 1246.28638
+name = 'module._orig_mod.transformer.h.10.attn.c_k.weight' | l1_to_l2_norm = 1.94899 | frobenius_norm = 54.06544 | spectral_norm = 4.94779 | nuclear_norm = 1228.58276
+name = 'module._orig_mod.transformer.h.10.attn.c_v.weight' | l1_to_l2_norm = 2.39342 | frobenius_norm = 66.41674 | spectral_norm = 5.85318 | nuclear_norm = 1469.81812
+name = 'module._orig_mod.transformer.h.10.attn.c_proj.weight' | l1_to_l2_norm = 2.65223 | frobenius_norm = 74.52399 | spectral_norm = 5.61689 | nuclear_norm = 1743.27759
+name = 'module._orig_mod.transformer.h.10.mlp.c_fc.weight' | l1_to_l2_norm = 4.49246 | frobenius_norm = 124.58979 | spectral_norm = 8.87531 | nuclear_norm = 3310.86230
+name = 'module._orig_mod.transformer.h.10.mlp.c_proj.weight' | l1_to_l2_norm = 1.08648 | frobenius_norm = 62.11535 | spectral_norm = 5.47798 | nuclear_norm = 1638.36987
+name = 'module._orig_mod.transformer.h.11.attn.c_q.weight' | l1_to_l2_norm = 1.96180 | frobenius_norm = 54.42174 | spectral_norm = 5.25857 | nuclear_norm = 1240.76184
+name = 'module._orig_mod.transformer.h.11.attn.c_k.weight' | l1_to_l2_norm = 1.95363 | frobenius_norm = 54.20349 | spectral_norm = 5.32820 | nuclear_norm = 1224.44141
+name = 'module._orig_mod.transformer.h.11.attn.c_v.weight' | l1_to_l2_norm = 2.29462 | frobenius_norm = 63.66146 | spectral_norm = 5.46779 | nuclear_norm = 1418.65112
+name = 'module._orig_mod.transformer.h.11.attn.c_proj.weight' | l1_to_l2_norm = 2.59931 | frobenius_norm = 73.38908 | spectral_norm = 5.19948 | nuclear_norm = 1709.84326
+name = 'module._orig_mod.transformer.h.11.mlp.c_fc.weight' | l1_to_l2_norm = 4.31505 | frobenius_norm = 119.68760 | spectral_norm = 8.98411 | nuclear_norm = 3183.86865
+name = 'module._orig_mod.transformer.h.11.mlp.c_proj.weight' | l1_to_l2_norm = 1.08052 | frobenius_norm = 60.98707 | spectral_norm = 5.48439 | nuclear_norm = 1602.32129
+name = 'module._orig_mod.lm_head.weight' | l1_to_l2_norm = 19.69877 | frobenius_norm = 546.30701 | spectral_norm = 148.89091 | nuclear_norm = 13567.43652
+===========================================
+step:251/1750 train_loss:4.0973 train_time:160850ms step_avg:667.43ms
+step:252/1750 train_loss:4.1994 train_time:161518ms step_avg:667.43ms
+step:253/1750 train_loss:3.9580 train_time:162188ms step_avg:667.44ms
+step:254/1750 train_loss:3.9074 train_time:162857ms step_avg:667.45ms
+step:255/1750 train_loss:4.1037 train_time:163528ms step_avg:667.46ms
+step:256/1750 train_loss:4.0126 train_time:164198ms step_avg:667.47ms
+step:257/1750 train_loss:4.0199 train_time:164869ms step_avg:667.49ms
+step:258/1750 train_loss:4.0166 train_time:165540ms step_avg:667.50ms
+step:259/1750 train_loss:4.0563 train_time:166212ms step_avg:667.52ms
+step:260/1750 train_loss:4.0925 train_time:166882ms step_avg:667.53ms
+step:261/1750 train_loss:4.0357 train_time:167572ms step_avg:667.62ms
+step:262/1750 train_loss:4.0170 train_time:168261ms step_avg:667.70ms
+step:263/1750 train_loss:3.9246 train_time:168953ms step_avg:667.80ms
+step:264/1750 train_loss:4.0194 train_time:169641ms step_avg:667.88ms
+step:265/1750 train_loss:3.8943 train_time:170331ms step_avg:667.96ms
+step:266/1750 train_loss:3.9362 train_time:171018ms step_avg:668.04ms
+step:267/1750 train_loss:3.9420 train_time:171708ms step_avg:668.12ms
+step:268/1750 train_loss:3.9793 train_time:172396ms step_avg:668.20ms
+step:269/1750 train_loss:3.8804 train_time:173085ms step_avg:668.28ms
+step:270/1750 train_loss:4.1211 train_time:173771ms step_avg:668.35ms
+step:271/1750 train_loss:3.9888 train_time:174458ms step_avg:668.42ms
+step:272/1750 train_loss:3.9435 train_time:175148ms step_avg:668.50ms
+step:273/1750 train_loss:3.9612 train_time:175835ms step_avg:668.58ms
+step:274/1750 train_loss:4.0541 train_time:176524ms step_avg:668.65ms
+step:275/1750 train_loss:4.0841 train_time:177215ms step_avg:668.73ms
+step:276/1750 train_loss:4.2488 train_time:177904ms step_avg:668.81ms
+step:277/1750 train_loss:4.0534 train_time:178590ms step_avg:668.88ms
+step:278/1750 train_loss:4.1204 train_time:179278ms step_avg:668.95ms
+step:279/1750 train_loss:4.0278 train_time:179967ms step_avg:669.02ms
+step:280/1750 train_loss:4.2264 train_time:180659ms step_avg:669.11ms
+step:281/1750 train_loss:3.9872 train_time:181350ms step_avg:669.19ms
+step:282/1750 train_loss:3.9738 train_time:182041ms step_avg:669.27ms
+step:283/1750 train_loss:3.9366 train_time:182731ms step_avg:669.35ms
+step:284/1750 train_loss:4.0684 train_time:183421ms step_avg:669.42ms
+step:285/1750 train_loss:4.0815 train_time:184112ms step_avg:669.50ms
+step:286/1750 train_loss:4.1196 train_time:184803ms step_avg:669.58ms
+step:287/1750 train_loss:3.9322 train_time:185493ms step_avg:669.65ms
+step:288/1750 train_loss:4.0376 train_time:186181ms step_avg:669.72ms
+step:289/1750 train_loss:3.9091 train_time:186871ms step_avg:669.79ms
+step:290/1750 train_loss:3.8817 train_time:187560ms step_avg:669.86ms
+step:291/1750 train_loss:3.9587 train_time:188248ms step_avg:669.92ms
+step:292/1750 train_loss:3.8831 train_time:188937ms step_avg:669.99ms
+step:293/1750 train_loss:3.9393 train_time:189625ms step_avg:670.05ms
+step:294/1750 train_loss:3.9641 train_time:190313ms step_avg:670.12ms
+step:295/1750 train_loss:3.8632 train_time:191003ms step_avg:670.19ms
+step:296/1750 train_loss:3.8841 train_time:191693ms step_avg:670.25ms
+step:297/1750 train_loss:3.9006 train_time:192383ms step_avg:670.32ms
+step:298/1750 train_loss:4.0089 train_time:193071ms step_avg:670.39ms
+step:299/1750 train_loss:3.8489 train_time:193761ms step_avg:670.45ms
+step:300/1750 train_loss:3.9881 train_time:194451ms step_avg:670.52ms
+step:301/1750 train_loss:3.9955 train_time:195141ms step_avg:670.59ms
+step:302/1750 train_loss:3.9582 train_time:195829ms step_avg:670.65ms
+step:303/1750 train_loss:4.0039 train_time:196518ms step_avg:670.71ms
+step:304/1750 train_loss:3.9911 train_time:197206ms step_avg:670.77ms
+step:305/1750 train_loss:4.4866 train_time:197893ms step_avg:670.83ms
+step:306/1750 train_loss:3.9652 train_time:198584ms step_avg:670.89ms
+step:307/1750 train_loss:3.8661 train_time:199274ms step_avg:670.96ms
+step:308/1750 train_loss:4.0141 train_time:199964ms step_avg:671.02ms
+step:309/1750 train_loss:3.8934 train_time:200653ms step_avg:671.08ms
+step:310/1750 train_loss:4.1058 train_time:201340ms step_avg:671.13ms
+step:311/1750 train_loss:3.9546 train_time:202030ms step_avg:671.20ms
+step:312/1750 train_loss:3.8916 train_time:202718ms step_avg:671.25ms
+step:313/1750 train_loss:3.9747 train_time:203409ms step_avg:671.32ms
+step:314/1750 train_loss:4.0982 train_time:204097ms step_avg:671.37ms
+step:315/1750 train_loss:3.9785 train_time:204784ms step_avg:671.42ms
+step:316/1750 train_loss:3.8251 train_time:205472ms step_avg:671.48ms
+step:317/1750 train_loss:3.9033 train_time:206161ms step_avg:671.54ms
+step:318/1750 train_loss:3.9483 train_time:206852ms step_avg:671.60ms
+step:319/1750 train_loss:3.9107 train_time:207540ms step_avg:671.65ms
+step:320/1750 train_loss:4.0409 train_time:208230ms step_avg:671.71ms
+step:321/1750 train_loss:3.9852 train_time:208919ms step_avg:671.76ms
+step:322/1750 train_loss:3.9615 train_time:209608ms step_avg:671.82ms
+step:323/1750 train_loss:4.0404 train_time:210295ms step_avg:671.87ms
+step:324/1750 train_loss:3.9727 train_time:210985ms step_avg:671.93ms
+step:325/1750 train_loss:4.0405 train_time:211674ms step_avg:671.98ms
+step:326/1750 train_loss:3.9118 train_time:212357ms step_avg:672.02ms
+step:327/1750 train_loss:4.4315 train_time:213043ms step_avg:672.06ms
+step:328/1750 train_loss:4.0945 train_time:213730ms step_avg:672.11ms
+step:329/1750 train_loss:3.8314 train_time:214418ms step_avg:672.16ms
+step:330/1750 train_loss:3.7677 train_time:215101ms step_avg:672.19ms
+step:331/1750 train_loss:4.0028 train_time:215787ms step_avg:672.23ms
+step:332/1750 train_loss:3.9301 train_time:216471ms step_avg:672.27ms
+step:333/1750 train_loss:3.9084 train_time:217155ms step_avg:672.31ms
+step:334/1750 train_loss:3.8588 train_time:217840ms step_avg:672.34ms
+step:335/1750 train_loss:4.0346 train_time:218525ms step_avg:672.38ms
+step:336/1750 train_loss:3.9802 train_time:219208ms step_avg:672.42ms
+step:337/1750 train_loss:4.4395 train_time:219894ms step_avg:672.46ms
+step:338/1750 train_loss:3.9707 train_time:220578ms step_avg:672.49ms
+step:339/1750 train_loss:3.8863 train_time:221265ms step_avg:672.54ms
+step:340/1750 train_loss:3.9512 train_time:221949ms step_avg:672.57ms
+step:341/1750 train_loss:3.8747 train_time:222634ms step_avg:672.61ms
+step:342/1750 train_loss:3.8351 train_time:223317ms step_avg:672.64ms
+step:343/1750 train_loss:3.8572 train_time:224004ms step_avg:672.68ms
+step:344/1750 train_loss:4.0128 train_time:224689ms step_avg:672.72ms
+step:345/1750 train_loss:3.8451 train_time:225374ms step_avg:672.76ms
+step:346/1750 train_loss:3.7855 train_time:226058ms step_avg:672.79ms
+step:347/1750 train_loss:3.8295 train_time:226746ms step_avg:672.84ms
+step:348/1750 train_loss:3.8805 train_time:227427ms step_avg:672.86ms
+step:349/1750 train_loss:3.8468 train_time:228110ms step_avg:672.89ms
+step:350/1750 train_loss:3.5865 train_time:228793ms step_avg:672.92ms
+step:351/1750 train_loss:3.8502 train_time:229476ms step_avg:672.95ms
+step:352/1750 train_loss:4.2169 train_time:230160ms step_avg:672.98ms
+step:353/1750 train_loss:3.6864 train_time:230846ms step_avg:673.02ms
+step:354/1750 train_loss:3.9513 train_time:231530ms step_avg:673.05ms
+step:355/1750 train_loss:3.8080 train_time:232215ms step_avg:673.09ms
+step:356/1750 train_loss:3.9043 train_time:232899ms step_avg:673.12ms
+step:357/1750 train_loss:3.7911 train_time:233583ms step_avg:673.15ms
+step:358/1750 train_loss:3.8824 train_time:234269ms step_avg:673.19ms
+step:359/1750 train_loss:3.8650 train_time:234954ms step_avg:673.22ms
+step:360/1750 train_loss:3.4759 train_time:235640ms step_avg:673.26ms
+step:361/1750 train_loss:4.0530 train_time:236323ms step_avg:673.29ms
+step:362/1750 train_loss:3.9444 train_time:237008ms step_avg:673.32ms
+step:363/1750 train_loss:3.8648 train_time:237692ms step_avg:673.35ms
+step:364/1750 train_loss:3.7682 train_time:238376ms step_avg:673.38ms
+step:365/1750 train_loss:3.9423 train_time:239060ms step_avg:673.41ms
+step:366/1750 train_loss:3.8965 train_time:239744ms step_avg:673.44ms
+step:367/1750 train_loss:3.8829 train_time:240429ms step_avg:673.47ms
+step:368/1750 train_loss:3.8703 train_time:241115ms step_avg:673.51ms
+step:369/1750 train_loss:3.7681 train_time:241798ms step_avg:673.53ms
+step:370/1750 train_loss:3.9151 train_time:242482ms step_avg:673.56ms
+step:371/1750 train_loss:3.7635 train_time:243164ms step_avg:673.58ms
+step:372/1750 train_loss:3.7233 train_time:243847ms step_avg:673.61ms
+step:373/1750 train_loss:3.9470 train_time:244531ms step_avg:673.64ms
+step:374/1750 train_loss:3.8534 train_time:245215ms step_avg:673.67ms
+step:375/1750 train_loss:3.8268 train_time:245898ms step_avg:673.69ms
+step:375/1750 val_loss:3.8512 train_time:245909ms step_avg:673.72ms
+============== Weight norms: ==============
+name = 'module._orig_mod.transformer.wte.weight' | l1_to_l2_norm = 1518.48633 | frobenius_norm = 42093.64844 | spectral_norm = 8288.80664 | nuclear_norm = 1034961.37500
+name = 'module._orig_mod.transformer.h.0.attn.c_q.weight' | l1_to_l2_norm = 2.98646 | frobenius_norm = 82.79525 | spectral_norm = 9.75200 | nuclear_norm = 1937.78577
+name = 'module._orig_mod.transformer.h.0.attn.c_k.weight' | l1_to_l2_norm = 2.90618 | frobenius_norm = 80.57387 | spectral_norm = 11.89116 | nuclear_norm = 1872.33057
+name = 'module._orig_mod.transformer.h.0.attn.c_v.weight' | l1_to_l2_norm = 3.78721 | frobenius_norm = 105.01846 | spectral_norm = 7.01245 | nuclear_norm = 2457.71045
+name = 'module._orig_mod.transformer.h.0.attn.c_proj.weight' | l1_to_l2_norm = 3.01892 | frobenius_norm = 83.74268 | spectral_norm = 7.40114 | nuclear_norm = 1966.82812
+name = 'module._orig_mod.transformer.h.0.mlp.c_fc.weight' | l1_to_l2_norm = 5.97310 | frobenius_norm = 165.55423 | spectral_norm = 13.16057 | nuclear_norm = 4403.24707
+name = 'module._orig_mod.transformer.h.0.mlp.c_proj.weight' | l1_to_l2_norm = 1.57110 | frobenius_norm = 87.46219 | spectral_norm = 7.04326 | nuclear_norm = 2324.21899
+name = 'module._orig_mod.transformer.h.1.attn.c_q.weight' | l1_to_l2_norm = 2.91333 | frobenius_norm = 80.77080 | spectral_norm = 7.53412 | nuclear_norm = 1885.58923
+name = 'module._orig_mod.transformer.h.1.attn.c_k.weight' | l1_to_l2_norm = 2.86320 | frobenius_norm = 79.38403 | spectral_norm = 8.05546 | nuclear_norm = 1851.09937
+name = 'module._orig_mod.transformer.h.1.attn.c_v.weight' | l1_to_l2_norm = 3.10345 | frobenius_norm = 86.05750 | spectral_norm = 7.48330 | nuclear_norm = 1976.65076
+name = 'module._orig_mod.transformer.h.1.attn.c_proj.weight' | l1_to_l2_norm = 3.16018 | frobenius_norm = 87.70026 | spectral_norm = 7.00047 | nuclear_norm = 2061.89380
+name = 'module._orig_mod.transformer.h.1.mlp.c_fc.weight' | l1_to_l2_norm = 6.13334 | frobenius_norm = 169.99318 | spectral_norm = 11.76814 | nuclear_norm = 4539.40332
+name = 'module._orig_mod.transformer.h.1.mlp.c_proj.weight' | l1_to_l2_norm = 1.59667 | frobenius_norm = 89.25151 | spectral_norm = 7.58392 | nuclear_norm = 2367.36743
+name = 'module._orig_mod.transformer.h.2.attn.c_q.weight' | l1_to_l2_norm = 2.88164 | frobenius_norm = 79.89639 | spectral_norm = 7.23213 | nuclear_norm = 1846.54834
+name = 'module._orig_mod.transformer.h.2.attn.c_k.weight' | l1_to_l2_norm = 2.85061 | frobenius_norm = 79.03499 | spectral_norm = 6.98236 | nuclear_norm = 1826.55200
+name = 'module._orig_mod.transformer.h.2.attn.c_v.weight' | l1_to_l2_norm = 3.24926 | frobenius_norm = 90.11430 | spectral_norm = 8.17806 | nuclear_norm = 2038.67480
+name = 'module._orig_mod.transformer.h.2.attn.c_proj.weight' | l1_to_l2_norm = 3.34093 | frobenius_norm = 92.85401 | spectral_norm = 7.51338 | nuclear_norm = 2183.51123
+name = 'module._orig_mod.transformer.h.2.mlp.c_fc.weight' | l1_to_l2_norm = 6.22440 | frobenius_norm = 172.52167 | spectral_norm = 12.36067 | nuclear_norm = 4608.50977
+name = 'module._orig_mod.transformer.h.2.mlp.c_proj.weight' | l1_to_l2_norm = 1.57713 | frobenius_norm = 88.41042 | spectral_norm = 7.19305 | nuclear_norm = 2340.10010
+name = 'module._orig_mod.transformer.h.3.attn.c_q.weight' | l1_to_l2_norm = 2.87409 | frobenius_norm = 79.69038 | spectral_norm = 7.67442 | nuclear_norm = 1847.85840
+name = 'module._orig_mod.transformer.h.3.attn.c_k.weight' | l1_to_l2_norm = 2.83909 | frobenius_norm = 78.71504 | spectral_norm = 7.71707 | nuclear_norm = 1828.18127
+name = 'module._orig_mod.transformer.h.3.attn.c_v.weight' | l1_to_l2_norm = 3.21226 | frobenius_norm = 89.10760 | spectral_norm = 7.74107 | nuclear_norm = 1968.16138
+name = 'module._orig_mod.transformer.h.3.attn.c_proj.weight' | l1_to_l2_norm = 3.22507 | frobenius_norm = 89.70386 | spectral_norm = 7.48754 | nuclear_norm = 2050.83203
+name = 'module._orig_mod.transformer.h.3.mlp.c_fc.weight' | l1_to_l2_norm = 6.49271 | frobenius_norm = 179.96663 | spectral_norm = 12.79795 | nuclear_norm = 4800.29980
+name = 'module._orig_mod.transformer.h.3.mlp.c_proj.weight' | l1_to_l2_norm = 1.57363 | frobenius_norm = 88.63566 | spectral_norm = 7.66090 | nuclear_norm = 2332.92212
+name = 'module._orig_mod.transformer.h.4.attn.c_q.weight' | l1_to_l2_norm = 2.82633 | frobenius_norm = 78.36607 | spectral_norm = 7.72643 | nuclear_norm = 1815.84875
+name = 'module._orig_mod.transformer.h.4.attn.c_k.weight' | l1_to_l2_norm = 2.80008 | frobenius_norm = 77.63873 | spectral_norm = 7.31046 | nuclear_norm = 1804.59644
+name = 'module._orig_mod.transformer.h.4.attn.c_v.weight' | l1_to_l2_norm = 3.21843 | frobenius_norm = 89.27223 | spectral_norm = 7.49840 | nuclear_norm = 1978.70190
+name = 'module._orig_mod.transformer.h.4.attn.c_proj.weight' | l1_to_l2_norm = 3.27872 | frobenius_norm = 91.52207 | spectral_norm = 7.17059 | nuclear_norm = 2087.58008
+name = 'module._orig_mod.transformer.h.4.mlp.c_fc.weight' | l1_to_l2_norm = 6.46922 | frobenius_norm = 179.32082 | spectral_norm = 13.36070 | nuclear_norm = 4775.26172
+name = 'module._orig_mod.transformer.h.4.mlp.c_proj.weight' | l1_to_l2_norm = 1.57064 | frobenius_norm = 88.49818 | spectral_norm = 7.35603 | nuclear_norm = 2337.43848
+name = 'module._orig_mod.transformer.h.5.attn.c_q.weight' | l1_to_l2_norm = 2.83108 | frobenius_norm = 78.49936 | spectral_norm = 7.08536 | nuclear_norm = 1792.62988
+name = 'module._orig_mod.transformer.h.5.attn.c_k.weight' | l1_to_l2_norm = 2.83178 | frobenius_norm = 78.51202 | spectral_norm = 6.75234 | nuclear_norm = 1798.79443
+name = 'module._orig_mod.transformer.h.5.attn.c_v.weight' | l1_to_l2_norm = 3.28339 | frobenius_norm = 91.09196 | spectral_norm = 7.93729 | nuclear_norm = 2020.36475
+name = 'module._orig_mod.transformer.h.5.attn.c_proj.weight' | l1_to_l2_norm = 3.41735 | frobenius_norm = 95.50010 | spectral_norm = 7.30019 | nuclear_norm = 2223.86621
+name = 'module._orig_mod.transformer.h.5.mlp.c_fc.weight' | l1_to_l2_norm = 6.64658 | frobenius_norm = 184.23547 | spectral_norm = 11.94823 | nuclear_norm = 4921.04395
+name = 'module._orig_mod.transformer.h.5.mlp.c_proj.weight' | l1_to_l2_norm = 1.55950 | frobenius_norm = 87.62064 | spectral_norm = 7.60169 | nuclear_norm = 2320.08887
+name = 'module._orig_mod.transformer.h.6.attn.c_q.weight' | l1_to_l2_norm = 2.91931 | frobenius_norm = 80.94322 | spectral_norm = 7.02571 | nuclear_norm = 1875.34546
+name = 'module._orig_mod.transformer.h.6.attn.c_k.weight' | l1_to_l2_norm = 2.86918 | frobenius_norm = 79.55256 | spectral_norm = 7.68838 | nuclear_norm = 1841.38940
+name = 'module._orig_mod.transformer.h.6.attn.c_v.weight' | l1_to_l2_norm = 2.92737 | frobenius_norm = 81.19400 | spectral_norm = 7.92021 | nuclear_norm = 1803.92578
+name = 'module._orig_mod.transformer.h.6.attn.c_proj.weight' | l1_to_l2_norm = 3.26756 | frobenius_norm = 90.89532 | spectral_norm = 6.61524 | nuclear_norm = 2131.78662
+name = 'module._orig_mod.transformer.h.6.mlp.c_fc.weight' | l1_to_l2_norm = 6.51203 | frobenius_norm = 180.50708 | spectral_norm = 13.19870 | nuclear_norm = 4817.85986
+name = 'module._orig_mod.transformer.h.6.mlp.c_proj.weight' | l1_to_l2_norm = 1.58697 | frobenius_norm = 89.71489 | spectral_norm = 7.79484 | nuclear_norm = 2373.82617
+name = 'module._orig_mod.transformer.h.7.attn.c_q.weight' | l1_to_l2_norm = 2.82844 | frobenius_norm = 78.44645 | spectral_norm = 7.55400 | nuclear_norm = 1801.83008
+name = 'module._orig_mod.transformer.h.7.attn.c_k.weight' | l1_to_l2_norm = 2.80452 | frobenius_norm = 77.77124 | spectral_norm = 7.49120 | nuclear_norm = 1791.78760
+name = 'module._orig_mod.transformer.h.7.attn.c_v.weight' | l1_to_l2_norm = 3.32938 | frobenius_norm = 92.36838 | spectral_norm = 8.84186 | nuclear_norm = 2031.13721
+name = 'module._orig_mod.transformer.h.7.attn.c_proj.weight' | l1_to_l2_norm = 3.48826 | frobenius_norm = 96.80390 | spectral_norm = 8.33088 | nuclear_norm = 2241.48730
+name = 'module._orig_mod.transformer.h.7.mlp.c_fc.weight' | l1_to_l2_norm = 6.63611 | frobenius_norm = 183.96823 | spectral_norm = 13.91481 | nuclear_norm = 4901.59668
+name = 'module._orig_mod.transformer.h.7.mlp.c_proj.weight' | l1_to_l2_norm = 1.59539 | frobenius_norm = 90.37829 | spectral_norm = 7.77728 | nuclear_norm = 2392.66846
+name = 'module._orig_mod.transformer.h.8.attn.c_q.weight' | l1_to_l2_norm = 2.90504 | frobenius_norm = 80.56432 | spectral_norm = 7.40956 | nuclear_norm = 1855.96826
+name = 'module._orig_mod.transformer.h.8.attn.c_k.weight' | l1_to_l2_norm = 2.89740 | frobenius_norm = 80.34858 | spectral_norm = 7.13954 | nuclear_norm = 1846.00781
+name = 'module._orig_mod.transformer.h.8.attn.c_v.weight' | l1_to_l2_norm = 3.52075 | frobenius_norm = 97.70444 | spectral_norm = 9.16115 | nuclear_norm = 2168.26782
+name = 'module._orig_mod.transformer.h.8.attn.c_proj.weight' | l1_to_l2_norm = 3.71162 | frobenius_norm = 103.65889 | spectral_norm = 7.29232 | nuclear_norm = 2446.35400
+name = 'module._orig_mod.transformer.h.8.mlp.c_fc.weight' | l1_to_l2_norm = 6.56256 | frobenius_norm = 181.94223 | spectral_norm = 13.62712 | nuclear_norm = 4848.02783
+name = 'module._orig_mod.transformer.h.8.mlp.c_proj.weight' | l1_to_l2_norm = 1.58850 | frobenius_norm = 89.92864 | spectral_norm = 7.94623 | nuclear_norm = 2381.33105
+name = 'module._orig_mod.transformer.h.9.attn.c_q.weight' | l1_to_l2_norm = 2.92728 | frobenius_norm = 81.18844 | spectral_norm = 7.58912 | nuclear_norm = 1870.91406
+name = 'module._orig_mod.transformer.h.9.attn.c_k.weight' | l1_to_l2_norm = 2.90506 | frobenius_norm = 80.56828 | spectral_norm = 7.39700 | nuclear_norm = 1852.93896
+name = 'module._orig_mod.transformer.h.9.attn.c_v.weight' | l1_to_l2_norm = 3.44628 | frobenius_norm = 95.61774 | spectral_norm = 8.72023 | nuclear_norm = 2138.46680
+name = 'module._orig_mod.transformer.h.9.attn.c_proj.weight' | l1_to_l2_norm = 3.65333 | frobenius_norm = 101.71724 | spectral_norm = 7.08393 | nuclear_norm = 2401.25757
+name = 'module._orig_mod.transformer.h.9.mlp.c_fc.weight' | l1_to_l2_norm = 6.58395 | frobenius_norm = 182.55315 | spectral_norm = 12.89827 | nuclear_norm = 4862.92480
+name = 'module._orig_mod.transformer.h.9.mlp.c_proj.weight' | l1_to_l2_norm = 1.55449 | frobenius_norm = 88.15085 | spectral_norm = 8.37265 | nuclear_norm = 2330.50439
+name = 'module._orig_mod.transformer.h.10.attn.c_q.weight' | l1_to_l2_norm = 2.91819 | frobenius_norm = 80.95388 | spectral_norm = 7.92291 | nuclear_norm = 1853.11230
+name = 'module._orig_mod.transformer.h.10.attn.c_k.weight' | l1_to_l2_norm = 2.88435 | frobenius_norm = 80.02580 | spectral_norm = 7.38316 | nuclear_norm = 1817.37134
+name = 'module._orig_mod.transformer.h.10.attn.c_v.weight' | l1_to_l2_norm = 3.47966 | frobenius_norm = 96.53447 | spectral_norm = 8.20330 | nuclear_norm = 2172.90552
+name = 'module._orig_mod.transformer.h.10.attn.c_proj.weight' | l1_to_l2_norm = 3.76210 | frobenius_norm = 105.76752 | spectral_norm = 7.68287 | nuclear_norm = 2478.33350
+name = 'module._orig_mod.transformer.h.10.mlp.c_fc.weight' | l1_to_l2_norm = 6.43252 | frobenius_norm = 178.37677 | spectral_norm = 12.38399 | nuclear_norm = 4755.84814
+name = 'module._orig_mod.transformer.h.10.mlp.c_proj.weight' | l1_to_l2_norm = 1.54673 | frobenius_norm = 87.15415 | spectral_norm = 8.59230 | nuclear_norm = 2304.72974
+name = 'module._orig_mod.transformer.h.11.attn.c_q.weight' | l1_to_l2_norm = 2.90430 | frobenius_norm = 80.58477 | spectral_norm = 8.16288 | nuclear_norm = 1831.93396
+name = 'module._orig_mod.transformer.h.11.attn.c_k.weight' | l1_to_l2_norm = 2.88028 | frobenius_norm = 79.94193 | spectral_norm = 8.11701 | nuclear_norm = 1797.51416
+name = 'module._orig_mod.transformer.h.11.attn.c_v.weight' | l1_to_l2_norm = 3.34639 | frobenius_norm = 92.83295 | spectral_norm = 8.10034 | nuclear_norm = 2103.65527
+name = 'module._orig_mod.transformer.h.11.attn.c_proj.weight' | l1_to_l2_norm = 3.72315 | frobenius_norm = 105.07823 | spectral_norm = 7.42217 | nuclear_norm = 2454.62524
+name = 'module._orig_mod.transformer.h.11.mlp.c_fc.weight' | l1_to_l2_norm = 6.26417 | frobenius_norm = 173.73645 | spectral_norm = 12.54288 | nuclear_norm = 4634.81250
+name = 'module._orig_mod.transformer.h.11.mlp.c_proj.weight' | l1_to_l2_norm = 1.52363 | frobenius_norm = 85.19515 | spectral_norm = 8.78199 | nuclear_norm = 2236.61621
+name = 'module._orig_mod.lm_head.weight' | l1_to_l2_norm = 24.76898 | frobenius_norm = 686.80151 | spectral_norm = 156.49638 | nuclear_norm = 17409.09375
+===========================================
+step:376/1750 train_loss:3.8920 train_time:246575ms step_avg:673.70ms
+step:377/1750 train_loss:3.8112 train_time:247257ms step_avg:673.73ms
+step:378/1750 train_loss:3.8637 train_time:247940ms step_avg:673.75ms
+step:379/1750 train_loss:3.8932 train_time:248620ms step_avg:673.77ms
+step:380/1750 train_loss:3.9757 train_time:249517ms step_avg:674.37ms
+step:381/1750 train_loss:3.7179 train_time:250411ms step_avg:674.96ms
+step:382/1750 train_loss:3.7925 train_time:251096ms step_avg:674.99ms
+step:383/1750 train_loss:3.8030 train_time:251779ms step_avg:675.01ms
+step:384/1750 train_loss:3.8999 train_time:252463ms step_avg:675.03ms
+step:385/1750 train_loss:3.6910 train_time:253146ms step_avg:675.06ms
+step:386/1750 train_loss:3.8848 train_time:253829ms step_avg:675.08ms
+step:387/1750 train_loss:3.8114 train_time:254514ms step_avg:675.10ms
+step:388/1750 train_loss:3.9958 train_time:255198ms step_avg:675.13ms
+step:389/1750 train_loss:3.8244 train_time:255880ms step_avg:675.14ms
+step:390/1750 train_loss:3.8912 train_time:256580ms step_avg:675.21ms
+step:391/1750 train_loss:3.7318 train_time:257279ms step_avg:675.27ms
+step:392/1750 train_loss:3.7961 train_time:257978ms step_avg:675.33ms
+step:393/1750 train_loss:3.8323 train_time:258674ms step_avg:675.39ms
+step:394/1750 train_loss:3.8192 train_time:259373ms step_avg:675.45ms
+step:395/1750 train_loss:3.8309 train_time:260072ms step_avg:675.51ms
+step:396/1750 train_loss:3.7389 train_time:260773ms step_avg:675.58ms
+step:397/1750 train_loss:3.6034 train_time:261474ms step_avg:675.64ms
+step:398/1750 train_loss:3.8474 train_time:262175ms step_avg:675.71ms
+step:399/1750 train_loss:3.8028 train_time:262874ms step_avg:675.77ms
+step:400/1750 train_loss:3.7270 train_time:263570ms step_avg:675.82ms
+step:401/1750 train_loss:3.8337 train_time:264270ms step_avg:675.88ms
+step:402/1750 train_loss:3.7165 train_time:264969ms step_avg:675.94ms
+step:403/1750 train_loss:4.0050 train_time:265672ms step_avg:676.01ms
+step:404/1750 train_loss:3.9230 train_time:266373ms step_avg:676.07ms
+step:405/1750 train_loss:3.8649 train_time:267072ms step_avg:676.13ms
+step:406/1750 train_loss:3.8811 train_time:267772ms step_avg:676.19ms
+step:407/1750 train_loss:3.8532 train_time:268468ms step_avg:676.24ms
+step:408/1750 train_loss:3.7651 train_time:269172ms step_avg:676.31ms
+step:409/1750 train_loss:3.8237 train_time:269870ms step_avg:676.37ms
+step:410/1750 train_loss:3.7718 train_time:270568ms step_avg:676.42ms
+step:411/1750 train_loss:3.7788 train_time:271265ms step_avg:676.47ms
+step:412/1750 train_loss:3.7878 train_time:271963ms step_avg:676.53ms
+step:413/1750 train_loss:3.7786 train_time:272665ms step_avg:676.59ms
+step:414/1750 train_loss:3.9026 train_time:273367ms step_avg:676.65ms
+step:415/1750 train_loss:3.7437 train_time:274076ms step_avg:676.73ms
+step:416/1750 train_loss:3.8177 train_time:274776ms step_avg:676.79ms
+step:417/1750 train_loss:3.9177 train_time:275476ms step_avg:676.85ms
+step:418/1750 train_loss:3.6850 train_time:276178ms step_avg:676.91ms
+step:419/1750 train_loss:3.9399 train_time:276875ms step_avg:676.96ms
+step:420/1750 train_loss:4.0175 train_time:277576ms step_avg:677.01ms
+step:421/1750 train_loss:3.7779 train_time:278275ms step_avg:677.07ms
+step:422/1750 train_loss:3.9132 train_time:278974ms step_avg:677.12ms
+step:423/1750 train_loss:3.6040 train_time:279675ms step_avg:677.18ms
+step:424/1750 train_loss:3.7953 train_time:280373ms step_avg:677.23ms
+step:425/1750 train_loss:3.6708 train_time:281074ms step_avg:677.29ms
+step:426/1750 train_loss:3.8825 train_time:281774ms step_avg:677.34ms
+step:427/1750 train_loss:3.8540 train_time:282473ms step_avg:677.39ms
+step:428/1750 train_loss:3.7827 train_time:283175ms step_avg:677.45ms
+step:429/1750 train_loss:3.8937 train_time:283874ms step_avg:677.50ms
+step:430/1750 train_loss:3.7141 train_time:284573ms step_avg:677.56ms
+step:431/1750 train_loss:3.6523 train_time:285276ms step_avg:677.62ms
+step:432/1750 train_loss:3.8564 train_time:285974ms step_avg:677.66ms
+step:433/1750 train_loss:3.8870 train_time:286671ms step_avg:677.71ms
+step:434/1750 train_loss:3.8686 train_time:287369ms step_avg:677.76ms
+step:435/1750 train_loss:3.7761 train_time:288070ms step_avg:677.81ms
+step:436/1750 train_loss:3.8507 train_time:288769ms step_avg:677.86ms
+step:437/1750 train_loss:3.8414 train_time:289466ms step_avg:677.91ms
+step:438/1750 train_loss:3.8150 train_time:290167ms step_avg:677.96ms
+step:439/1750 train_loss:3.8835 train_time:290868ms step_avg:678.01ms
+step:440/1750 train_loss:3.7249 train_time:291571ms step_avg:678.07ms
+step:441/1750 train_loss:3.8305 train_time:292272ms step_avg:678.12ms
+step:442/1750 train_loss:3.7436 train_time:292973ms step_avg:678.18ms
+step:443/1750 train_loss:3.6435 train_time:293674ms step_avg:678.23ms
+step:444/1750 train_loss:3.7908 train_time:294371ms step_avg:678.27ms
+step:445/1750 train_loss:4.0510 train_time:295073ms step_avg:678.33ms
+step:446/1750 train_loss:3.6585 train_time:295771ms step_avg:678.37ms
+step:447/1750 train_loss:3.8508 train_time:296470ms step_avg:678.42ms
+step:448/1750 train_loss:3.9023 train_time:297170ms step_avg:678.47ms
+step:449/1750 train_loss:3.7230 train_time:297871ms step_avg:678.52ms
+step:450/1750 train_loss:3.6899 train_time:298572ms step_avg:678.57ms
+step:451/1750 train_loss:3.7471 train_time:299276ms step_avg:678.63ms
+step:452/1750 train_loss:4.0681 train_time:299978ms step_avg:678.68ms
+step:453/1750 train_loss:3.9631 train_time:300677ms step_avg:678.73ms
+step:454/1750 train_loss:3.8287 train_time:301378ms step_avg:678.78ms
+step:455/1750 train_loss:3.7238 train_time:302075ms step_avg:678.82ms
+step:456/1750 train_loss:3.8380 train_time:302774ms step_avg:678.86ms
+step:457/1750 train_loss:3.7686 train_time:303467ms step_avg:678.90ms
+step:458/1750 train_loss:3.7827 train_time:304162ms step_avg:678.93ms
+step:459/1750 train_loss:3.8807 train_time:304859ms step_avg:678.97ms
+step:460/1750 train_loss:3.6860 train_time:305557ms step_avg:679.02ms
+step:461/1750 train_loss:3.8064 train_time:306255ms step_avg:679.06ms
+step:462/1750 train_loss:3.7656 train_time:306950ms step_avg:679.09ms
+step:463/1750 train_loss:3.6086 train_time:307646ms step_avg:679.13ms
+step:464/1750 train_loss:3.7639 train_time:308342ms step_avg:679.17ms
+step:465/1750 train_loss:3.8463 train_time:309037ms step_avg:679.20ms
+step:466/1750 train_loss:3.7428 train_time:309734ms step_avg:679.24ms
+step:467/1750 train_loss:3.7404 train_time:310430ms step_avg:679.28ms
+step:468/1750 train_loss:3.7249 train_time:311126ms step_avg:679.31ms
+step:469/1750 train_loss:3.9239 train_time:311820ms step_avg:679.35ms
+step:470/1750 train_loss:3.7651 train_time:312515ms step_avg:679.38ms
+step:471/1750 train_loss:3.6213 train_time:313214ms step_avg:679.42ms
+step:472/1750 train_loss:3.8383 train_time:313909ms step_avg:679.46ms
+step:473/1750 train_loss:3.6985 train_time:314603ms step_avg:679.49ms
+step:474/1750 train_loss:3.8255 train_time:315299ms step_avg:679.52ms
+step:475/1750 train_loss:3.8876 train_time:315992ms step_avg:679.55ms
+step:476/1750 train_loss:4.0531 train_time:316690ms step_avg:679.59ms
+step:477/1750 train_loss:3.8476 train_time:317386ms step_avg:679.63ms
+step:478/1750 train_loss:3.8040 train_time:318082ms step_avg:679.66ms
+step:479/1750 train_loss:3.7536 train_time:318778ms step_avg:679.70ms
+step:480/1750 train_loss:3.7025 train_time:319477ms step_avg:679.74ms
+step:481/1750 train_loss:3.7366 train_time:320172ms step_avg:679.77ms
+step:482/1750 train_loss:3.8538 train_time:320869ms step_avg:679.81ms
+step:483/1750 train_loss:3.7728 train_time:321563ms step_avg:679.84ms
+step:484/1750 train_loss:3.8499 train_time:322260ms step_avg:679.87ms
+step:485/1750 train_loss:3.7862 train_time:322956ms step_avg:679.91ms
+step:486/1750 train_loss:3.6199 train_time:323652ms step_avg:679.94ms
+step:487/1750 train_loss:3.7537 train_time:324346ms step_avg:679.97ms
+step:488/1750 train_loss:3.7629 train_time:325043ms step_avg:680.01ms
+step:489/1750 train_loss:3.7674 train_time:325735ms step_avg:680.03ms
+step:490/1750 train_loss:3.9763 train_time:326428ms step_avg:680.06ms
+step:491/1750 train_loss:3.7086 train_time:327123ms step_avg:680.09ms
+step:492/1750 train_loss:3.6677 train_time:327818ms step_avg:680.12ms
+step:493/1750 train_loss:3.7986 train_time:328511ms step_avg:680.15ms
+step:494/1750 train_loss:3.5758 train_time:329210ms step_avg:680.19ms
+step:495/1750 train_loss:3.7349 train_time:329906ms step_avg:680.22ms
+step:496/1750 train_loss:3.9118 train_time:330604ms step_avg:680.25ms
+step:497/1750 train_loss:3.7643 train_time:331300ms step_avg:680.29ms
+step:498/1750 train_loss:3.7490 train_time:331998ms step_avg:680.32ms
+step:499/1750 train_loss:3.7209 train_time:332692ms step_avg:680.35ms
+step:500/1750 train_loss:3.8239 train_time:333389ms step_avg:680.39ms
+step:500/1750 val_loss:3.7285 train_time:333400ms step_avg:680.41ms
+============== Weight norms: ==============
+name = 'module._orig_mod.transformer.wte.weight' | l1_to_l2_norm = 1704.97559 | frobenius_norm = 47262.91016 | spectral_norm = 8912.66211 | nuclear_norm = 1167886.75000
+name = 'module._orig_mod.transformer.h.0.attn.c_q.weight' | l1_to_l2_norm = 3.77448 | frobenius_norm = 104.64576 | spectral_norm = 13.65693 | nuclear_norm = 2440.68018
+name = 'module._orig_mod.transformer.h.0.attn.c_k.weight' | l1_to_l2_norm = 3.65022 | frobenius_norm = 101.20338 | spectral_norm = 15.87006 | nuclear_norm = 2343.72998
+name = 'module._orig_mod.transformer.h.0.attn.c_v.weight' | l1_to_l2_norm = 4.75273 | frobenius_norm = 131.79225 | spectral_norm = 8.66517 | nuclear_norm = 3102.20947
+name = 'module._orig_mod.transformer.h.0.attn.c_proj.weight' | l1_to_l2_norm = 3.77799 | frobenius_norm = 104.81873 | spectral_norm = 9.87983 | nuclear_norm = 2452.13867
+name = 'module._orig_mod.transformer.h.0.mlp.c_fc.weight' | l1_to_l2_norm = 7.64563 | frobenius_norm = 211.91287 | spectral_norm = 16.79761 | nuclear_norm = 5634.40137
+name = 'module._orig_mod.transformer.h.0.mlp.c_proj.weight' | l1_to_l2_norm = 2.00564 | frobenius_norm = 111.53832 | spectral_norm = 9.84127 | nuclear_norm = 2961.27051
+name = 'module._orig_mod.transformer.h.1.attn.c_q.weight' | l1_to_l2_norm = 3.68963 | frobenius_norm = 102.29778 | spectral_norm = 9.70653 | nuclear_norm = 2379.52173
+name = 'module._orig_mod.transformer.h.1.attn.c_k.weight' | l1_to_l2_norm = 3.61167 | frobenius_norm = 100.14484 | spectral_norm = 10.07012 | nuclear_norm = 2327.59082
+name = 'module._orig_mod.transformer.h.1.attn.c_v.weight' | l1_to_l2_norm = 3.91256 | frobenius_norm = 108.49100 | spectral_norm = 9.52691 | nuclear_norm = 2506.10205
+name = 'module._orig_mod.transformer.h.1.attn.c_proj.weight' | l1_to_l2_norm = 3.96881 | frobenius_norm = 110.12293 | spectral_norm = 8.89053 | nuclear_norm = 2588.09082
+name = 'module._orig_mod.transformer.h.1.mlp.c_fc.weight' | l1_to_l2_norm = 7.73794 | frobenius_norm = 214.46725 | spectral_norm = 15.40583 | nuclear_norm = 5727.42188
+name = 'module._orig_mod.transformer.h.1.mlp.c_proj.weight' | l1_to_l2_norm = 2.01532 | frobenius_norm = 112.42631 | spectral_norm = 10.30059 | nuclear_norm = 2978.78076
+name = 'module._orig_mod.transformer.h.2.attn.c_q.weight' | l1_to_l2_norm = 3.63959 | frobenius_norm = 100.91671 | spectral_norm = 9.45948 | nuclear_norm = 2317.96704
+name = 'module._orig_mod.transformer.h.2.attn.c_k.weight' | l1_to_l2_norm = 3.60041 | frobenius_norm = 99.82668 | spectral_norm = 8.91827 | nuclear_norm = 2295.68774
+name = 'module._orig_mod.transformer.h.2.attn.c_v.weight' | l1_to_l2_norm = 4.15060 | frobenius_norm = 115.10654 | spectral_norm = 10.41680 | nuclear_norm = 2616.81763
+name = 'module._orig_mod.transformer.h.2.attn.c_proj.weight' | l1_to_l2_norm = 4.23453 | frobenius_norm = 117.65199 | spectral_norm = 9.64988 | nuclear_norm = 2764.62427
+name = 'module._orig_mod.transformer.h.2.mlp.c_fc.weight' | l1_to_l2_norm = 7.79891 | frobenius_norm = 216.15781 | spectral_norm = 16.10001 | nuclear_norm = 5773.64307
+name = 'module._orig_mod.transformer.h.2.mlp.c_proj.weight' | l1_to_l2_norm = 1.97836 | frobenius_norm = 110.53954 | spectral_norm = 9.65064 | nuclear_norm = 2923.31787
+name = 'module._orig_mod.transformer.h.3.attn.c_q.weight' | l1_to_l2_norm = 3.65555 | frobenius_norm = 101.35756 | spectral_norm = 10.11845 | nuclear_norm = 2340.21875
+name = 'module._orig_mod.transformer.h.3.attn.c_k.weight' | l1_to_l2_norm = 3.60660 | frobenius_norm = 100.00130 | spectral_norm = 9.82000 | nuclear_norm = 2315.15234
+name = 'module._orig_mod.transformer.h.3.attn.c_v.weight' | l1_to_l2_norm = 4.13557 | frobenius_norm = 114.71714 | spectral_norm = 9.93026 | nuclear_norm = 2547.32715
+name = 'module._orig_mod.transformer.h.3.attn.c_proj.weight' | l1_to_l2_norm = 4.10848 | frobenius_norm = 114.23112 | spectral_norm = 9.47109 | nuclear_norm = 2618.56738
+name = 'module._orig_mod.transformer.h.3.mlp.c_fc.weight' | l1_to_l2_norm = 8.10918 | frobenius_norm = 224.76834 | spectral_norm = 17.36184 | nuclear_norm = 5994.38867
+name = 'module._orig_mod.transformer.h.3.mlp.c_proj.weight' | l1_to_l2_norm = 1.96163 | frobenius_norm = 110.01040 | spectral_norm = 10.06788 | nuclear_norm = 2889.87256
+name = 'module._orig_mod.transformer.h.4.attn.c_q.weight' | l1_to_l2_norm = 3.58425 | frobenius_norm = 99.38376 | spectral_norm = 10.24363 | nuclear_norm = 2290.55127
+name = 'module._orig_mod.transformer.h.4.attn.c_k.weight' | l1_to_l2_norm = 3.54466 | frobenius_norm = 98.28847 | spectral_norm = 9.45799 | nuclear_norm = 2277.82324
+name = 'module._orig_mod.transformer.h.4.attn.c_v.weight' | l1_to_l2_norm = 4.07723 | frobenius_norm = 113.08474 | spectral_norm = 9.44628 | nuclear_norm = 2518.45679
+name = 'module._orig_mod.transformer.h.4.attn.c_proj.weight' | l1_to_l2_norm = 4.11254 | frobenius_norm = 114.68962 | spectral_norm = 9.07373 | nuclear_norm = 2612.41309
+name = 'module._orig_mod.transformer.h.4.mlp.c_fc.weight' | l1_to_l2_norm = 8.05286 | frobenius_norm = 223.21063 | spectral_norm = 17.38308 | nuclear_norm = 5940.01025
+name = 'module._orig_mod.transformer.h.4.mlp.c_proj.weight' | l1_to_l2_norm = 1.96598 | frobenius_norm = 110.23196 | spectral_norm = 9.92546 | nuclear_norm = 2906.92432
+name = 'module._orig_mod.transformer.h.5.attn.c_q.weight' | l1_to_l2_norm = 3.57381 | frobenius_norm = 99.09404 | spectral_norm = 9.20732 | nuclear_norm = 2246.68701
+name = 'module._orig_mod.transformer.h.5.attn.c_k.weight' | l1_to_l2_norm = 3.56211 | frobenius_norm = 98.76352 | spectral_norm = 8.69794 | nuclear_norm = 2247.17065
+name = 'module._orig_mod.transformer.h.5.attn.c_v.weight' | l1_to_l2_norm = 4.16582 | frobenius_norm = 115.55441 | spectral_norm = 9.94775 | nuclear_norm = 2578.55933
+name = 'module._orig_mod.transformer.h.5.attn.c_proj.weight' | l1_to_l2_norm = 4.28824 | frobenius_norm = 119.69827 | spectral_norm = 9.19394 | nuclear_norm = 2782.09717
+name = 'module._orig_mod.transformer.h.5.mlp.c_fc.weight' | l1_to_l2_norm = 8.38340 | frobenius_norm = 232.37218 | spectral_norm = 15.84427 | nuclear_norm = 6205.92529
+name = 'module._orig_mod.transformer.h.5.mlp.c_proj.weight' | l1_to_l2_norm = 1.96924 | frobenius_norm = 110.16401 | spectral_norm = 10.38676 | nuclear_norm = 2914.12280
+name = 'module._orig_mod.transformer.h.6.attn.c_q.weight' | l1_to_l2_norm = 3.69735 | frobenius_norm = 102.51930 | spectral_norm = 9.18512 | nuclear_norm = 2361.66064
+name = 'module._orig_mod.transformer.h.6.attn.c_k.weight' | l1_to_l2_norm = 3.63962 | frobenius_norm = 100.91804 | spectral_norm = 10.12690 | nuclear_norm = 2323.07739
+name = 'module._orig_mod.transformer.h.6.attn.c_v.weight' | l1_to_l2_norm = 3.78163 | frobenius_norm = 104.88813 | spectral_norm = 11.17778 | nuclear_norm = 2312.84546
+name = 'module._orig_mod.transformer.h.6.attn.c_proj.weight' | l1_to_l2_norm = 4.03221 | frobenius_norm = 112.06088 | spectral_norm = 8.30951 | nuclear_norm = 2632.13330
+name = 'module._orig_mod.transformer.h.6.mlp.c_fc.weight' | l1_to_l2_norm = 8.34000 | frobenius_norm = 231.17245 | spectral_norm = 17.34394 | nuclear_norm = 6172.19775
+name = 'module._orig_mod.transformer.h.6.mlp.c_proj.weight' | l1_to_l2_norm = 2.02446 | frobenius_norm = 113.83092 | spectral_norm = 10.15032 | nuclear_norm = 3008.84741
+name = 'module._orig_mod.transformer.h.7.attn.c_q.weight' | l1_to_l2_norm = 3.59054 | frobenius_norm = 99.58240 | spectral_norm = 9.83546 | nuclear_norm = 2279.92920
+name = 'module._orig_mod.transformer.h.7.attn.c_k.weight' | l1_to_l2_norm = 3.55231 | frobenius_norm = 98.51493 | spectral_norm = 9.95538 | nuclear_norm = 2263.50000
+name = 'module._orig_mod.transformer.h.7.attn.c_v.weight' | l1_to_l2_norm = 4.21922 | frobenius_norm = 117.04400 | spectral_norm = 11.02667 | nuclear_norm = 2581.00049
+name = 'module._orig_mod.transformer.h.7.attn.c_proj.weight' | l1_to_l2_norm = 4.29602 | frobenius_norm = 119.23911 | spectral_norm = 10.20118 | nuclear_norm = 2735.99756
+name = 'module._orig_mod.transformer.h.7.mlp.c_fc.weight' | l1_to_l2_norm = 8.36950 | frobenius_norm = 232.01717 | spectral_norm = 18.10125 | nuclear_norm = 6182.30469
+name = 'module._orig_mod.transformer.h.7.mlp.c_proj.weight' | l1_to_l2_norm = 2.02639 | frobenius_norm = 113.92012 | spectral_norm = 10.57730 | nuclear_norm = 3016.09448
+name = 'module._orig_mod.transformer.h.8.attn.c_q.weight' | l1_to_l2_norm = 3.68596 | frobenius_norm = 102.22863 | spectral_norm = 9.83013 | nuclear_norm = 2340.04419
+name = 'module._orig_mod.transformer.h.8.attn.c_k.weight' | l1_to_l2_norm = 3.68983 | frobenius_norm = 102.32886 | spectral_norm = 9.51841 | nuclear_norm = 2337.24268
+name = 'module._orig_mod.transformer.h.8.attn.c_v.weight' | l1_to_l2_norm = 4.49572 | frobenius_norm = 124.75465 | spectral_norm = 11.85023 | nuclear_norm = 2768.92334
+name = 'module._orig_mod.transformer.h.8.attn.c_proj.weight' | l1_to_l2_norm = 4.68593 | frobenius_norm = 130.98532 | spectral_norm = 9.13330 | nuclear_norm = 3090.20850
+name = 'module._orig_mod.transformer.h.8.mlp.c_fc.weight' | l1_to_l2_norm = 8.22401 | frobenius_norm = 228.00072 | spectral_norm = 17.66292 | nuclear_norm = 6077.86816
+name = 'module._orig_mod.transformer.h.8.mlp.c_proj.weight' | l1_to_l2_norm = 2.02619 | frobenius_norm = 113.79737 | spectral_norm = 10.76667 | nuclear_norm = 3016.07031
+name = 'module._orig_mod.transformer.h.9.attn.c_q.weight' | l1_to_l2_norm = 3.72302 | frobenius_norm = 103.26542 | spectral_norm = 9.92504 | nuclear_norm = 2364.60498
+name = 'module._orig_mod.transformer.h.9.attn.c_k.weight' | l1_to_l2_norm = 3.69510 | frobenius_norm = 102.48799 | spectral_norm = 9.71006 | nuclear_norm = 2340.45288
+name = 'module._orig_mod.transformer.h.9.attn.c_v.weight' | l1_to_l2_norm = 4.40786 | frobenius_norm = 122.28268 | spectral_norm = 11.30652 | nuclear_norm = 2744.21460
+name = 'module._orig_mod.transformer.h.9.attn.c_proj.weight' | l1_to_l2_norm = 4.59495 | frobenius_norm = 128.04622 | spectral_norm = 8.91440 | nuclear_norm = 3018.79932
+name = 'module._orig_mod.transformer.h.9.mlp.c_fc.weight' | l1_to_l2_norm = 8.28839 | frobenius_norm = 229.80406 | spectral_norm = 16.75652 | nuclear_norm = 6125.17627
+name = 'module._orig_mod.transformer.h.9.mlp.c_proj.weight' | l1_to_l2_norm = 1.96068 | frobenius_norm = 110.26532 | spectral_norm = 11.23006 | nuclear_norm = 2916.27148
+name = 'module._orig_mod.transformer.h.10.attn.c_q.weight' | l1_to_l2_norm = 3.70983 | frobenius_norm = 102.92791 | spectral_norm = 10.49726 | nuclear_norm = 2339.64819
+name = 'module._orig_mod.transformer.h.10.attn.c_k.weight' | l1_to_l2_norm = 3.67155 | frobenius_norm = 101.88232 | spectral_norm = 9.79684 | nuclear_norm = 2295.24170
+name = 'module._orig_mod.transformer.h.10.attn.c_v.weight' | l1_to_l2_norm = 4.44431 | frobenius_norm = 123.28602 | spectral_norm = 10.63961 | nuclear_norm = 2786.78613
+name = 'module._orig_mod.transformer.h.10.attn.c_proj.weight' | l1_to_l2_norm = 4.73137 | frobenius_norm = 133.04726 | spectral_norm = 9.62343 | nuclear_norm = 3111.54175
+name = 'module._orig_mod.transformer.h.10.mlp.c_fc.weight' | l1_to_l2_norm = 8.08835 | frobenius_norm = 224.29071 | spectral_norm = 15.57082 | nuclear_norm = 5983.26660
+name = 'module._orig_mod.transformer.h.10.mlp.c_proj.weight' | l1_to_l2_norm = 1.95494 | frobenius_norm = 109.46271 | spectral_norm = 11.51310 | nuclear_norm = 2896.87158
+name = 'module._orig_mod.transformer.h.11.attn.c_q.weight' | l1_to_l2_norm = 3.68527 | frobenius_norm = 102.27328 | spectral_norm = 11.22696 | nuclear_norm = 2304.79102
+name = 'module._orig_mod.transformer.h.11.attn.c_k.weight' | l1_to_l2_norm = 3.65147 | frobenius_norm = 101.37299 | spectral_norm = 10.63459 | nuclear_norm = 2258.74292
+name = 'module._orig_mod.transformer.h.11.attn.c_v.weight' | l1_to_l2_norm = 4.30552 | frobenius_norm = 119.43655 | spectral_norm = 10.84893 | nuclear_norm = 2717.00293
+name = 'module._orig_mod.transformer.h.11.attn.c_proj.weight' | l1_to_l2_norm = 4.71086 | frobenius_norm = 132.90378 | spectral_norm = 9.47822 | nuclear_norm = 3104.10400
+name = 'module._orig_mod.transformer.h.11.mlp.c_fc.weight' | l1_to_l2_norm = 7.97043 | frobenius_norm = 221.05342 | spectral_norm = 15.75230 | nuclear_norm = 5897.46289
+name = 'module._orig_mod.transformer.h.11.mlp.c_proj.weight' | l1_to_l2_norm = 1.90319 | frobenius_norm = 106.10917 | spectral_norm = 12.33606 | nuclear_norm = 2781.02612
+name = 'module._orig_mod.lm_head.weight' | l1_to_l2_norm = 29.10229 | frobenius_norm = 806.88361 | spectral_norm = 160.23605 | nuclear_norm = 20689.87109
+===========================================
+step:501/1750 train_loss:3.7139 train_time:334079ms step_avg:680.41ms
+step:502/1750 train_loss:3.6639 train_time:334774ms step_avg:680.43ms
+step:503/1750 train_loss:3.7682 train_time:335463ms step_avg:680.45ms
+step:504/1750 train_loss:3.6308 train_time:336155ms step_avg:680.48ms
+step:505/1750 train_loss:4.0477 train_time:336848ms step_avg:680.50ms
+step:506/1750 train_loss:3.7081 train_time:337545ms step_avg:680.53ms
+step:507/1750 train_loss:3.7913 train_time:338240ms step_avg:680.56ms
+step:508/1750 train_loss:3.9711 train_time:338934ms step_avg:680.59ms
+step:509/1750 train_loss:3.6707 train_time:339628ms step_avg:680.62ms
+step:510/1750 train_loss:3.7644 train_time:340321ms step_avg:680.64ms
+step:511/1750 train_loss:3.7720 train_time:341019ms step_avg:680.68ms
+step:512/1750 train_loss:3.5920 train_time:341712ms step_avg:680.70ms
