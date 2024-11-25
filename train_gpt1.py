@@ -588,19 +588,15 @@ for step in range(args.num_iterations + 1):
                         continue
                     if "transformer.wte" in name:
                         l1_to_l2_norm = torch.norm(p.data.float(), p=2, dim=1).mean().item()
-                    if p.grad is not None:
-                        dual_norm = torch.trace(p.data.T @ p.grad).item()
-                    else:
-                        dual_norm = -1
                     frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
                     spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
                     nuclear_norm = torch.linalg.matrix_norm(p.data.float(), ord="nuc").item()
                     if "transformer.wte" in name:
-                        print(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f} | {dual_norm = :.5f}")
-                        f.write(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f} | {dual_norm = :.5f}\n")
+                        print(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                        f.write(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
                     else:
-                        print(f"{name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f} | {dual_norm = :.5f}")
-                        f.write(f"{name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f} | {dual_norm = :.5f}\n")
+                        print(f"{name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                        f.write(f"{name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
                 f.write("===========================================\n")
             print("===========================================")
         # start the clock again
@@ -639,8 +635,18 @@ for step in range(args.num_iterations + 1):
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
-    for p in model.parameters():
+    if master_process:
+        print("============== Dual norms: ==============")
+        f.write("============== Dual norms: ==============\n")
+    for name, p in model.named_parameters():
         p.grad /= train_accumulation_steps
+        if master_process and p.ndim == 2:
+            dual_norm = torch.trace(p.data.T @ p.grad).item()
+            print(f"{name = } | {dual_norm = :.5f}")
+            f.write(f"{name = } | {dual_norm = :.5f}\n")
+    if master_process:
+        f.write("===========================================\n")
+        print("===========================================")
     # momentum warmup for Muon
     frac = min(step/300, 1)
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
