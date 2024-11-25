@@ -585,11 +585,12 @@ for step in range(args.num_iterations + 1):
                 f.write("============== Weight norms: ==============\n")
                 for name, p in model.named_parameters():
                     if p.ndim == 2:
+                        l1_to_l2_norm = torch.norm(p.data.float(), p=2, dim=0)
                         frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
                         spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
                         nuclear_norm = torch.linalg.matrix_norm(p.data.float(), ord="nuc").item()
-                        print(f"{name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
-                        f.write(f"{name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
+                        print(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                        f.write(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
                 f.write("===========================================\n")
             print("===========================================")
         # start the clock again
