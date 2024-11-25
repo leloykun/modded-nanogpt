@@ -637,16 +637,19 @@ for step in range(args.num_iterations + 1):
             loss.backward() # just sync on the last step
     if master_process:
         print("============== Dual norms: ==============")
-        f.write("============== Dual norms: ==============\n")
+        with open(logfile, "a") as f:
+            f.write("============== Dual norms: ==============\n")
     for name, p in model.named_parameters():
         p.grad /= train_accumulation_steps
         if master_process and p.ndim == 2:
             dual_norm = torch.trace(p.data.T @ p.grad).item()
             print(f"{name = } | {dual_norm = :.5f}")
-            f.write(f"{name = } | {dual_norm = :.5f}\n")
+            with open(logfile, "a") as f:
+                f.write(f"{name = } | {dual_norm = :.5f}\n")
     if master_process:
         f.write("===========================================\n")
-        print("===========================================")
+        with open(logfile, "a") as f:
+            print("===========================================")
     # momentum warmup for Muon
     frac = min(step/300, 1)
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
