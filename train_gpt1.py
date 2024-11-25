@@ -433,6 +433,7 @@ class Hyperparameters:
     num_iterations : int = 1750 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    block_size_warmup_iters = 1000
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -553,7 +554,7 @@ t0 = time.time()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # Set the attention blocksize for the current step, in chunks of 64
-    attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
+    attn_blocksize = torch.tensor(64*((min(step/args.block_size_warmup_iters, 1) * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
     # steps with dummy data first, and then re-initialize the model and reset the loader.
@@ -635,21 +636,8 @@ for step in range(args.num_iterations + 1):
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
-    if master_process and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
-        print("============== Dual norms: ==============")
-        with open(logfile, "a") as f:
-            f.write("============== Dual norms: ==============\n")
     for name, p in model.named_parameters():
         p.grad /= train_accumulation_steps
-        if master_process and p.ndim == 2 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
-            dual_norm = torch.trace(p.data.T @ p.grad).item()
-            print(f"{name = } | {dual_norm = :.10f}")
-            with open(logfile, "a") as f:
-                f.write(f"{name = } | {dual_norm = :.10f}\n")
-    if master_process and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
-        print("===========================================")
-        with open(logfile, "a") as f:
-            f.write("===========================================\n")
     # momentum warmup for Muon
     frac = min(step/300, 1)
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
