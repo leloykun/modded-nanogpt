@@ -308,13 +308,13 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, target):
+    def forward(self, idx, target, attn_blocksize: int):
 
         docs = (idx == 50256).cumsum(0)
         def document_causal_mask(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
             document_mask = docs[q_idx] == docs[kv_idx]
-            window_mask = q_idx - kv_idx < 1024
+            window_mask = q_idx - kv_idx < attn_blocksize
             return causal_mask & document_mask & window_mask
 
         softcap_mod = generate_tanh_softcap(self.attention_soft_cap, approx=True)  # @leloykun
@@ -430,9 +430,9 @@ class Hyperparameters:
     batch_size : int = 8 # batch size, in sequences, across all devices
     device_batch_size : int = 1 # batch size, in sequences, per device
     sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1875 # number of iterations to run
+    num_iterations : int = 1750 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 562 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -518,26 +518,26 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.9, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.04, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
-# learning rate decay scheduler (linear warmup and warmdown)
+# learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
     # 1) linear warmup for warmup_iters steps
     if it < args.warmup_iters:
         return (it+1) / args.warmup_iters
     # 2) constant lr for a while
-    elif it < args.num_iterations - args.warmdown_iters:
+    elif it < args.num_iterations - args.cooldown_iters:
         return 1.0
-    # 3) linear warmdown
+    # 3) linear cooldown
     else:
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+        decay_ratio = (args.num_iterations - it) / args.cooldown_iters
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
@@ -549,6 +549,8 @@ t0 = time.time()
 # begin training
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
+    # Set the attention blocksize for the current step, in chunks of 64
+    attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
     # steps with dummy data first, and then re-initialize the model and reset the loader.
@@ -569,27 +571,11 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 x_val, y_val = val_loader.next_batch()
-                val_loss += model(x_val, y_val)
+                val_loss += model(x_val, y_val, attn_blocksize=attn_blocksize)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
-        if master_process:
-            with open(logfile, "a") as f:
-                print("============== Weight norms: ==============")
-                f.write("============== Weight norms: ==============\n")
-                for name, p in model.named_parameters():
-                    if p.ndim != 2:
-                        continue
-                    if "c_q" not in name and "c_k" not in name:
-                        continue
-                    fro_norm = torch.linalg.norm(p.data.float(), ord="fro").item()
-                    spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
-                    nuclear_norm = torch.linalg.matrix_norm(p.data.float(), ord="nuc").item()
-                    print(f"{name = } | {fro_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
-                    f.write(f"{name = } | {fro_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
-                f.write("===========================================\n")
-                print("===========================================")
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -616,7 +602,7 @@ for step in range(args.num_iterations + 1):
     model.train()
     for i in range(1, train_accumulation_steps+1):
         # forward pass
-        loss = model(x, y)
+        loss = model(x, y, attn_blocksize=attn_blocksize)
         train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
@@ -629,7 +615,7 @@ for step in range(args.num_iterations + 1):
     for p in model.parameters():
         p.grad /= train_accumulation_steps
     # momentum warmup for Muon
-    frac = min(step/500, 1)
+    frac = min(step/300, 1)
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
