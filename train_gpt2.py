@@ -528,7 +528,7 @@ class Hyperparameters:
     num_iterations : int = 1750 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
-    weight_decay : float = 0.01
+    weight_decay : float = 0.001
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
