@@ -225,9 +225,6 @@ class CausalSelfAttention(nn.Module):
         self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        with torch.no_grad():
-            self.c_q.weight.data.mul_(1.25)
-            self.c_k.weight.data.mul_(1.25)
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
