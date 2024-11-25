@@ -520,12 +520,15 @@ enable_math_sdp(False)
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
+param_names = [name for name, _ in raw_model.named_parameters()]
 params = list(raw_model.transformer.h.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
+qk_params = [p for n, p in param_names, params if p.ndim == 2 and ("c_q" in n or "c_k" in n)]
+matrix_params = [p for n, p in param_names, params if p.ndim == 2 and "c_q" not in n and "c_k" not in n]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.08, momentum=0.95)
+optimizer5 = Muon(qk_params, lr=0.08, momentum=0.95)
+optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4, optimizer5]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
