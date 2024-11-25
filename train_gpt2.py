@@ -551,8 +551,6 @@ for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # Set the attention blocksize for the current step, in chunks of 64
     attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
-    if step == 1:
-        attn_blocksize = 896
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
     # steps with dummy data first, and then re-initialize the model and reset the loader.
