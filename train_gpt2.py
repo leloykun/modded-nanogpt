@@ -682,12 +682,17 @@ for step in range(args.num_iterations + 1):
                 for name, p in model.named_parameters():
                     if p.ndim != 2:
                         continue
-                    l1_to_l2_norm = torch.norm(p.data.float(), p=2, dim=0).mean().item()
+                    if "transformer.wte" in name:
+                        l1_to_l2_norm = torch.norm(p.data.float(), p=2, dim=1).mean().item()
                     frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
                     spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
                     nuclear_norm = torch.linalg.matrix_norm(p.data.float(), ord="nuc").item()
-                    print(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
-                    f.write(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
+                    if "transformer.wte" in name:
+                        print(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                        f.write(f"{name = } | {l1_to_l2_norm = :.5f} | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
+                    else:
+                        print(f"{name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                        f.write(f"{name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
                 f.write("===========================================\n")
             print("===========================================")
         # start the clock again
