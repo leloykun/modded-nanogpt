@@ -643,9 +643,9 @@ for step in range(args.num_iterations + 1):
         p.grad /= train_accumulation_steps
         if master_process and p.ndim == 2 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
             dual_norm = torch.trace(p.data.T @ p.grad).item()
-            print(f"{name = } | {dual_norm = :.5f}")
+            print(f"{name = } | {dual_norm = :.10f}")
             with open(logfile, "a") as f:
-                f.write(f"{name = } | {dual_norm = :.5f}\n")
+                f.write(f"{name = } | {dual_norm = :.10f}\n")
     if master_process and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         print("===========================================")
         with open(logfile, "a") as f:
