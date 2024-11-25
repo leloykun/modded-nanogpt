@@ -591,7 +591,7 @@ for step in range(args.num_iterations + 1):
                     if p.grad is not None:
                         dual_norm = torch.trace(p.data.T @ p.grad)
                     else:
-                        dual_norm = None
+                        dual_norm = ""
                     frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
                     spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
                     nuclear_norm = torch.linalg.matrix_norm(p.data.float(), ord="nuc").item()
