@@ -635,18 +635,18 @@ for step in range(args.num_iterations + 1):
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
-    if master_process:
+    if master_process and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         print("============== Dual norms: ==============")
         with open(logfile, "a") as f:
             f.write("============== Dual norms: ==============\n")
     for name, p in model.named_parameters():
         p.grad /= train_accumulation_steps
-        if master_process and p.ndim == 2:
+        if master_process and p.ndim == 2 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
             dual_norm = torch.trace(p.data.T @ p.grad).item()
             print(f"{name = } | {dual_norm = :.5f}")
             with open(logfile, "a") as f:
                 f.write(f"{name = } | {dual_norm = :.5f}\n")
-    if master_process:
+    if master_process and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         print("===========================================")
         with open(logfile, "a") as f:
             f.write("===========================================\n")
