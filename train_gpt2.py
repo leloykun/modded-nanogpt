@@ -582,6 +582,19 @@ for step in range(args.num_iterations + 1):
         val_loss /= val_steps
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        if master_process:
+            print("============== Weight norms: ==============")
+            with open(logfile, "a") as f:
+                f.write("============== Weight norms: ==============\n")
+                for name, p in model.named_parameters():
+                    if p.ndim == 2:
+                        frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
+                        spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
+                        nuclear_norm = torch.linalg.matrix_norm(p.data.float(), ord="nuc").item()
+                        print(f"{name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                        f.write(f"{name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
+                f.write("===========================================\n")
+            print("===========================================")
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
