@@ -647,9 +647,9 @@ for step in range(args.num_iterations + 1):
             with open(logfile, "a") as f:
                 f.write(f"{name = } | {dual_norm = :.5f}\n")
     if master_process:
-        f.write("===========================================\n")
+        print("===========================================")
         with open(logfile, "a") as f:
-            print("===========================================")
+            f.write("===========================================\n")
     # momentum warmup for Muon
     frac = min(step/300, 1)
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
