@@ -588,7 +588,10 @@ for step in range(args.num_iterations + 1):
                         continue
                     if "transformer.wte" in name:
                         l1_to_l2_norm = torch.norm(p.data.float(), p=2, dim=1).mean().item()
-                    dual_norm = torch.trace(p.data.T @ p.grad)
+                    if p.grad is not None:
+                        dual_norm = torch.trace(p.data.T @ p.grad)
+                    else:
+                        dual_norm = None
                     frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
                     spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
                     nuclear_norm = torch.linalg.matrix_norm(p.data.float(), ord="nuc").item()
