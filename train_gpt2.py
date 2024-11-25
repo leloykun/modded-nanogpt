@@ -147,7 +147,7 @@ def ell_p_to_ell_infty_dualizer(G: torch.Tensor, p: float) -> torch.Tensor:
     q = 1 if p == float("inf") else p / (p - 1)
     return ell_one_to_ell_p_dualizer(G.T, q).T
 
-def induced_operator_norm_dualizer(G: torch.Tensor, p: float, q: float, steps: int = 5) -> torch.Tensor:
+def induced_operator_norm_dualizer(G: torch.Tensor, p: float, q: float) -> torch.Tensor:
     if p == 2 and q == 2:
         raise NotImplementedError("Use Muon instead.")
     elif p == 1 and q == float("inf"):
@@ -171,13 +171,13 @@ class DualizerWithGradientEstimation(torch.optim.Optimizer):
         backend: str = "induced_operator_norm_dualizer",
         backend_input_ell_norm: float = 2,
         backend_output_ell_norm: float = 2,
-        backend_steps: int = 5,
     ):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
                         backend=backend, backend_input_ell_norm=backend_input_ell_norm,
-                        backend_output_ell_norm=backend_output_ell_norm, backend_steps=backend_steps)
+                        backend_output_ell_norm=backend_output_ell_norm)
         super().__init__(params, defaults)
 
+    @torch.no_grad()
     def step(self):
 
         for group in self.param_groups:
@@ -202,12 +202,7 @@ class DualizerWithGradientEstimation(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if group['nesterov']:
                         g = g.add(buf, alpha=momentum)
-                    g = backend(
-                        g,
-                        group["backend_input_ell_norm"],
-                        group["backend_output_ell_norm"],
-                        group["backend_steps"],
-                    )
+                    g = backend(g, group["backend_input_ell_norm"], group["backend_output_ell_norm"])
                     updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
                 curr_idx += p.numel()
 
@@ -400,10 +395,6 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
-        with torch.no_grad():
-            self.transformer.wte.weight.data.div_(
-                (1 / config.n_embd)**0.5 * torch.norm(self.transformer.wte.weight.data, p=2, dim=1).unsqueeze(1)
-            )
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
@@ -617,7 +608,8 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.06,   betas=(0.8, 0.95), fused=True)
+# optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
+optimizer1 = DualizerWithGradientEstimation([raw_model.transformer.wte.weight], lr=0.6, backend_output_ell_norm=float('inf'))
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
