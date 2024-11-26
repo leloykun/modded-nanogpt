@@ -682,27 +682,27 @@ for step in range(args.num_iterations + 1):
                 if "transformer.wte" in name:
                     l1_to_l2_norm = torch.norm(p.grad.float(), p=2, dim=1).mean().item()
                     l1_to_rms_norm = (1/p.grad.size(1))**0.5 * l1_to_l2_norm
-                    print(f"W {name = } | {l1_to_l2_norm = :.5f} | {l1_to_rms_norm = :.5f}")
-                    f.write(f"W {name = } | {l1_to_l2_norm = :.5f} | {l1_to_rms_norm = :.5f}\n")
+                    print(f"G {name = } | {l1_to_l2_norm = :.5f} | {l1_to_rms_norm = :.5f}")
+                    f.write(f"G {name = } | {l1_to_l2_norm = :.5f} | {l1_to_rms_norm = :.5f}\n")
                 elif "attn.c_q" in name or "attn.c_k" in name:
                     frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
                     spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
                     nuclear_norm = torch.linalg.matrix_norm(p.grad.float(), ord="nuc").item()
-                    print(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
-                    f.write(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
+                    print(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                    f.write(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
                     for h in range(gpt_config.n_head):
                         head_dim = gpt_config.n_embd // gpt_config.n_head
                         frobenius_norm = torch.linalg.norm(p.grad.float()[h*head_dim:(h+1)*head_dim,], ord='fro').item()
                         spectral_norm = torch.linalg.matrix_norm(p.grad.float()[h*head_dim:(h+1)*head_dim,], ord=2).item()
                         nuclear_norm = torch.linalg.matrix_norm(p.grad.float()[h*head_dim:(h+1)*head_dim,], ord="nuc").item()
-                        print(f"W {name = } | {h = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
-                        f.write(f"W {name = } | {h = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
+                        print(f"G {name = } | {h = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                        f.write(f"G {name = } | {h = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
                 else:
                     frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
                     spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
                     nuclear_norm = torch.linalg.matrix_norm(p.grad.float(), ord="nuc").item()
-                    print(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
-                    f.write(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
+                    print(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}")
+                    f.write(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {nuclear_norm = :.5f}\n")
             f.write("===========================================\n")
         print("===========================================")
     # null the gradients
