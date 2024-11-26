@@ -122,8 +122,8 @@ class Muon(torch.optim.Optimizer):
             # deserialize and apply updates
             curr_idx = 0
             for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                p.data.add_(g, alpha=-lr)
+                p.grad = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                p.data.add_(p.grad, alpha=-lr)
                 curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
