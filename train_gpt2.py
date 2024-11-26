@@ -78,11 +78,12 @@ class Muon(torch.optim.Optimizer):
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, shards=1,
                  backend='newtonschulz5', backend_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, shards=shards, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
 
+    @torch.no_grad()
     def step(self):
 
         for group in self.param_groups:
@@ -98,7 +99,7 @@ class Muon(torch.optim.Optimizer):
             for i, p in enumerate(group['params']):
                 # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
                 if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
-                    g = p.grad
+                    g: torch.Tensor | None = p.grad
                     assert g is not None
                     state = self.state[p]
                     if 'momentum_buffer' not in state:
@@ -107,8 +108,16 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if group['nesterov']:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
+                    if group['shards'] > 1:
+                        shard_size = g.size(0) // group['shards']
+                        for i in range(group['shards']):
+                            g_shard = g[i*shard_size:(i+1)*shard_size,]
+                            g_shard = zeropower_backend(g_shard, steps=group['backend_steps'])
+                            g_shard *= max(1, g_shard.size(0)/g_shard.size(1))**0.5
+                            g[i*shard_size:(i+1)*shard_size,] = g_shard
+                    else:
+                        g = zeropower_backend(g, steps=group['backend_steps'])
+                        g *= max(1, g.size(0)/g.size(1))**0.5
                     updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
                 curr_idx += p.numel()
 
@@ -438,7 +447,8 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model_config = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768)
+model = GPT(model_config)
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -460,12 +470,15 @@ enable_math_sdp(False)
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
+param_names = [name for name, _ in raw_model.named_parameters()]
 params = list(raw_model.transformer.h.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
+qk_params = [p for n, p in zip(param_names, params) if p.ndim == 2 and ("c_q" in n or "c_k" in n)]
+matrix_params = [p for n, p in zip(param_names, params) if p.ndim == 2 and "c_q" not in n and "c_k" not in n]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+optimizer4 = Muon(qk_params, lr=0.05, momentum=0.95, shards=model_config.n_head)
+optimizer5 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4, optimizer5]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
