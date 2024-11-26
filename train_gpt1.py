@@ -308,7 +308,7 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, target, attn_blocksize: int):
+    def forward(self, idx, target, attn_blocksize):
 
         docs = (idx == 50256).cumsum(0)
         def document_causal_mask(b, h, q_idx, kv_idx):
@@ -433,7 +433,9 @@ class Hyperparameters:
     num_iterations : int = 1750 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
-    block_size_warmup_iters = 1000
+    block_size_warmup_iters : int = 1000
+    block_size_warmup_step : int = 64
+    block_size_warmup_max : int = 1792
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -554,7 +556,16 @@ t0 = time.time()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # Set the attention blocksize for the current step, in chunks of 64
-    attn_blocksize = torch.tensor(64*((min(step/args.block_size_warmup_iters, 1) * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
+    attn_blocksize = torch.tensor(
+        args.block_size_warmup_step
+        * (
+            1 +
+            (min(step/args.block_size_warmup_iters, 1) * (args.block_size_warmup_max - args.block_size_warmup_step))
+            // args.block_size_warmup_step
+        ),
+        dtype=torch.int,
+        device='cuda',
+    )
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
     # steps with dummy data first, and then re-initialize the model and reset the loader.
