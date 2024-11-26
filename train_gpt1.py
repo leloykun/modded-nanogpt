@@ -561,7 +561,7 @@ for step in range(args.num_iterations + 1):
         args.block_size_warmup_step
         * (
             1 +
-            (min(step/args.block_size_warmup_iters, 1)**0.5 * (args.block_size_warmup_max - args.block_size_warmup_step))
+            (min(step/args.block_size_warmup_iters, 1)**2 * (args.block_size_warmup_max - args.block_size_warmup_step))
             // args.block_size_warmup_step
         ),
         dtype=torch.int,
