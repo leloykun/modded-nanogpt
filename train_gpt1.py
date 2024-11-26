@@ -435,7 +435,7 @@ class Hyperparameters:
     cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     block_size_warmup_iters : int = 1700
     block_size_warmup_step : int = 8
-    block_size_warmup_max : int = 2560
+    block_size_warmup_max : int = 2304
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
