@@ -438,9 +438,12 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1750 # number of iterations to run
+    num_iterations : int = 1700 # number of iterations to run
     warmup_iters : int = 0
-    cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    cooldown_iters : int = 622 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    block_size_warmup_iters : int = 1600
+    block_size_warmup_step : int = 8
+    block_size_warmup_max : int = 1792
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -563,8 +566,17 @@ for step in range(args.num_iterations + 1):
         t0 = time.time()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Set the attention blocksize for the current step, in chunks of 64. By @fernbear.bsky.social
-    attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
+    # Set the attention blocksize for the current step, in chunks of args.block_size_warmup_step. By @fernbear.bsky.social
+    attn_blocksize = torch.tensor(
+        args.block_size_warmup_step
+        * (
+            1 +
+            (min(step/args.block_size_warmup_iters, 1) * (args.block_size_warmup_max - args.block_size_warmup_step))
+            // args.block_size_warmup_step
+        ),
+        dtype=torch.int,
+        device='cuda',
+    )
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
