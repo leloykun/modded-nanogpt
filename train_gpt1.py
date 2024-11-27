@@ -317,8 +317,7 @@ class GPT(nn.Module):
             window_mask = q_idx - kv_idx < attn_blocksize
             return causal_mask & document_mask & window_mask
 
-        # softcap_mod = generate_tanh_softcap(self.attention_soft_cap, approx=True)  # @leloykun
-        softcap_mod = None
+        softcap_mod = generate_tanh_softcap(self.attention_soft_cap, approx=True)  # @leloykun
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
@@ -431,10 +430,10 @@ class Hyperparameters:
     batch_size : int = 8 # batch size, in sequences, across all devices
     device_batch_size : int = 1 # batch size, in sequences, per device
     sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1685 # number of iterations to run
+    num_iterations : int = 1700 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 622 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
-    block_size_warmup_iters : int = 1500
+    block_size_warmup_iters : int = 1600
     block_size_warmup_step : int = 8
     block_size_warmup_max : int = 2048
     weight_decay : float = 0
@@ -525,12 +524,15 @@ enable_math_sdp(False)
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
+param_names = [name for name, _ in raw_model.named_parameters()]
 params = list(raw_model.transformer.h.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
+qk_params = [p for n, p in zip(param_names, params) if p.ndim == 2 and ("c_q" in n or "c_k" in n)]
+matrix_params = [p for n, p in zip(param_names, params) if p.ndim == 2 and "c_q" not in n and "c_k" not in n]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+optimizer5 = Muon(qk_params, lr=0.08, momentum=0.95)
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4, optimizer5]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
