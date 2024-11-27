@@ -255,7 +255,7 @@ class MLP(nn.Module):
         self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
@@ -317,6 +317,8 @@ class GPT(nn.Module):
             window_mask = q_idx - kv_idx < attn_blocksize
             return causal_mask & document_mask & window_mask
 
+        # This makes val_loss a bit worse, but it stabilizes training at larger learning rates and with more layers
+        # See [Methods on Improving LLM Training Stability](https://arxiv.org/abs/2410.16682) from NVidia
         softcap_mod = generate_tanh_softcap(self.attention_soft_cap, approx=True)  # @leloykun
 
         S = len(idx)
@@ -529,7 +531,9 @@ params = list(raw_model.transformer.h.parameters())
 qk_params = [p for n, p in zip(param_names, params) if p.ndim == 2 and ("c_q" in n or "c_k" in n)]
 matrix_params = [p for n, p in zip(param_names, params) if p.ndim == 2 and "c_q" not in n and "c_k" not in n]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer5 = Muon(qk_params, lr=0.08, momentum=0.95)
+# Attention softcapping allows us to increase the learning rates for the QK weights
+# See [Methods on Improving LLM Training Stability](https://arxiv.org/abs/2410.16682) from NVidia
+optimizer5 = Muon(qk_params, lr=0.08, momentum=0.95)  # @leloykun
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4, optimizer5]
