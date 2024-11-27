@@ -317,7 +317,8 @@ class GPT(nn.Module):
             window_mask = q_idx - kv_idx < attn_blocksize
             return causal_mask & document_mask & window_mask
 
-        softcap_mod = generate_tanh_softcap(self.attention_soft_cap, approx=True)  # @leloykun
+        # softcap_mod = generate_tanh_softcap(self.attention_soft_cap, approx=True)  # @leloykun
+        softcap_mod = None
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
