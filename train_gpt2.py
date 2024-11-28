@@ -418,7 +418,7 @@ class DistributedDataLoader:
     def next_batch(self):
         batch_size = self.T * self.num_processes
         buf = self.tokens[self.current_position:self.current_position+self.T+1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        buf = torch.tensor(buf, dtype=torch.long)
         x = buf[:-1] # inputs
         y = buf[1:] # targets
         # advance current position and load next shard if necessary
@@ -440,8 +440,8 @@ class Hyperparameters:
     sequence_length : int = 64*1024 # sequence length, in tokens
     num_iterations : int = 1700 # number of iterations to run
     warmup_iters : int = 0
-    cooldown_iters : int = 622 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
-    block_size_warmup_iters : int = 1600
+    cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    block_size_warmup_iters : int = 1792
     block_size_warmup_step : int = 8
     block_size_warmup_max : int = 1792
     weight_decay : float = 0
