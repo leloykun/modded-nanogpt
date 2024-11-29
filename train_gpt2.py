@@ -172,7 +172,7 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim, n_head):
         super().__init__()
         assert dim % n_head == 0
-        self.qk_norm_scale = 1.0 / (dim // n_head) ** 0.5
+        self.qk_norm_scale = 3.0 / (dim // n_head) ** 0.5
         self.n_head = n_head
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, dim)
