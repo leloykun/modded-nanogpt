@@ -172,7 +172,6 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim, n_head):
         super().__init__()
         assert dim % n_head == 0
-        self.qk_norm_scale = 3.0 / (dim // n_head) ** 0.5
         self.n_head = n_head
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, dim)
@@ -185,16 +184,16 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x, v1, block_mask):
+    def forward(self, x: torch.Tensor, v1: torch.Tensor | None, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = self.c_q(x).view(B, T, self.n_head, -1)
-        k = self.c_k(x).view(B, T, self.n_head, -1)
-        v = self.c_v(x).view(B, T, self.n_head, -1)
+        q: torch.Tensor = self.c_q(x).view(B, T, self.n_head, -1)
+        k: torch.Tensor = self.c_k(x).view(B, T, self.n_head, -1)
+        v: torch.Tensor = self.c_v(x).view(B, T, self.n_head, -1)
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
-        q, k = norm(q) * self.qk_norm_scale, norm(k) * self.qk_norm_scale # QK norm suggested by @Grad62304977; scaling suggested by @leloykun
+        q, k = F.layer_norm(q, (q.size(-1),)), F.layer_norm(k, (k.size(-1),))
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
