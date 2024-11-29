@@ -16,7 +16,7 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 flex_attention = torch.compile(flex_attention, dynamic=False)
 create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
@@ -79,9 +79,9 @@ class Muon(torch.optim.Optimizer):
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, shards=1,
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
                  backend='newtonschulz5', backend_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, shards=shards, backend=backend, backend_steps=backend_steps)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
 
     def step(self):
@@ -108,14 +108,7 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if group['nesterov']:
                         g = g.add(buf, alpha=momentum)
-                    if group["shards"] == 1:
-                        g = zeropower_backend(g, steps=group['backend_steps'])
-                    else:
-                        shard_size = g.size(0) // group["shards"]
-                        for i in range(group["shards"]):
-                            g[i*shard_size:(i+1)*shard_size,] = zeropower_backend(
-                                g[i*shard_size:(i+1)*shard_size,], steps=group['backend_steps']
-                            )
+                    g = zeropower_backend(g, steps=group['backend_steps'])
                     g *= max(1, g.size(0)/g.size(1))**0.5
                     updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
                 curr_idx += p.numel()
@@ -179,6 +172,7 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim, n_head):
         super().__init__()
         assert dim % n_head == 0
+        self.qk_norm_scale = 1.0 / (dim // n_head) ** 0.5
         self.n_head = n_head
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, dim)
@@ -191,7 +185,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x, v1, block_mask: BlockMask):
+    def forward(self, x, v1, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q = self.c_q(x).view(B, T, self.n_head, -1)
@@ -200,7 +194,7 @@ class CausalSelfAttention(nn.Module):
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
-        q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
+        q, k = norm(q) * self.qk_norm_scale, norm(k) * self.qk_norm_scale # QK norm suggested by @Grad62304977; scaling suggested by @leloykun
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
@@ -229,7 +223,7 @@ class Block(nn.Module):
         self.mlp = MLP(config.n_embd)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, v1, x0, block_mask: BlockMask):
+    def forward(self, x, v1, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         x1, v1 = self.attn(norm(x), v1, block_mask)
         x = x + x1
@@ -245,13 +239,11 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
-    lm_head_soft_cap : int = 30
 
 class GPT(nn.Module):
 
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config):
         super().__init__()
-        self.lm_head_soft_cap = config.lm_head_soft_cap
 
         # U-net design by @brendanh0gan
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
@@ -297,7 +289,7 @@ class GPT(nn.Module):
 
         x = norm(x)
         logits = self.lm_head(x)
-        logits = self.lm_head_soft_cap * torch.tanh(logits / self.lm_head_soft_cap) # @Grad62304977
+        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
         return loss
@@ -364,7 +356,7 @@ class DistributedDataLoader:
     def next_batch(self):
         batch_size = self.T * self.num_processes
         buf = self.tokens[self.current_position:self.current_position+self.T+1]
-        buf = torch.tensor(buf, dtype=torch.long)
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
         x = buf[:-1] # inputs
         y = buf[1:] # targets
         # advance current position and load next shard if necessary
@@ -387,9 +379,6 @@ class Hyperparameters:
     num_iterations : int = 1750 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
-    block_size_warmup_iters : int = 1792
-    block_size_warmup_step : int = 64
-    block_size_warmup_max : int = 1792
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -455,8 +444,7 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model_config = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768)
-model = GPT(model_config)
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -471,15 +459,12 @@ raw_model = model.module # always contains the "raw" unwrapped model
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
-param_names = [name for name, _ in raw_model.named_parameters()]
 params = list(raw_model.transformer.h.parameters())
-qkv_params = [p for n, p in zip(param_names, params) if p.ndim == 2 and ("c_q" in n or "c_k" in n or "c_v" in n)]
-matrix_params = [p for n, p in zip(param_names, params) if p.ndim == 2 and "c_q" not in n and "c_k" not in n and "c_v" not in n]
+matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer5 = Muon(qkv_params, lr=0.05, momentum=0.95, shards=model_config.n_head)
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4, optimizer5]
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -511,17 +496,8 @@ for step in range(args.num_iterations + 1):
         t0 = time.time()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Set the attention blocksize for the current step, in chunks of args.block_size_warmup_step. By @fernbear.bsky.social
-    attn_blocksize = torch.tensor(
-        args.block_size_warmup_step
-        * (
-            1 +
-            (min(step/args.block_size_warmup_iters, 1) * (args.block_size_warmup_max - args.block_size_warmup_step))
-            // args.block_size_warmup_step
-        ),
-        dtype=torch.int,
-        device='cuda',
-    )
+    # Set the attention blocksize for the current step, in chunks of 64. By @fernbear.bsky.social
+    attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
