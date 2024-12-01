@@ -16,7 +16,7 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask
 flex_attention = torch.compile(flex_attention, dynamic=False)
 create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
@@ -126,7 +126,7 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
-def norm(x):
+def norm(x: torch.Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
@@ -134,12 +134,12 @@ class CastedLinear(nn.Linear):
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         return F.linear(x, self.weight.to(x.dtype))
 
 class Rotary(torch.nn.Module):
 
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim: int, base: int = 10000):
         super().__init__()
         self.dim = dim
         self.base = base
@@ -148,19 +148,18 @@ class Rotary(torch.nn.Module):
         self.cos_cached = None
         self.sin_cached = None
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
-            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
+            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device, dtype=torch.float32) / self.dim))
             self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            t = torch.arange(seq_len, device=x.device, dtype=torch.float32)
             freqs = torch.outer(t, self.inv_freq)
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
+            self.cos_cached = freqs.cos()
+            self.sin_cached = freqs.sin()
         cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
-        # apply_rotary_emb(x, cos, sin)
         assert x.ndim == 4 # multihead attention
-        d = x.shape[3]//2
+        d = x.shape[3] // 2
         x1 = x[..., :d]
         x2 = x[..., d:]
         y1 = x1 * cos + x2 * sin
@@ -169,7 +168,7 @@ class Rotary(torch.nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, dim, n_head):
+    def __init__(self, dim: int, n_head: int):
         super().__init__()
         assert dim % n_head == 0
         self.n_head = n_head
@@ -184,7 +183,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x: torch.Tensor, v1: torch.Tensor | None, block_mask):
+    def forward(self, x: torch.Tensor, v1: torch.Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q: torch.Tensor = self.c_q(x).view(B, T, self.n_head, -1)
@@ -193,7 +192,7 @@ class CausalSelfAttention(nn.Module):
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
-        q, k = F.layer_norm(q, (q.size(-1),)), F.layer_norm(k, (k.size(-1),))
+        q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
@@ -202,13 +201,13 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
         self.c_fc   = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
@@ -222,7 +221,7 @@ class Block(nn.Module):
         self.mlp = MLP(config.n_embd)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, v1, x0, block_mask):
+    def forward(self, x: torch.Tensor, v1: torch.Tensor | None, x0: torch.Tensor, block_mask: BlockMask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         x1, v1 = self.attn(norm(x), v1, block_mask)
         x = x + x1
@@ -241,7 +240,7 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig):
         super().__init__()
 
         # U-net design by @brendanh0gan
