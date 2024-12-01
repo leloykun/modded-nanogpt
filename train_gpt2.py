@@ -457,8 +457,7 @@ if hasattr(config, "coordinate_descent_tuning"):
 # model = torch.compile(model)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
-# raw_model = model.module # always contains the "raw" unwrapped model
-raw_model = model
+raw_model = model.module # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
