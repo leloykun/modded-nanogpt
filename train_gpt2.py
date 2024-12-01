@@ -443,7 +443,7 @@ model = model.cuda().bfloat16()
 #     if isinstance(m, CastedLinear):
 #         m.float()
 def module_filter_fn(module: nn.Module, name: str) -> bool:
-    if name in ["wte", "lm_head"]:
+    if name in ["wte", "lm_head", "rotary"]:
         return False
     if isinstance(module, nn.Linear):
         if module.in_features % 16 != 0 or module.out_features % 16 != 0:
