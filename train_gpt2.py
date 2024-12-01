@@ -438,7 +438,7 @@ x, y = train_loader.next_batch()
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 # Cast the model to mixed bfloat16, float32, & float8 precision; suggested by @leloykun
-model = model.cuda().bfloat16()
+model = model.to(device=device, dtype=torch.bfloat16)
 # for m in model.modules():
 #     if isinstance(m, CastedLinear):
 #         m.float()
