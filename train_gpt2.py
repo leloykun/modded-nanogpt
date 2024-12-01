@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torchao.float8 import convert_to_float8_training
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 flex_attention = torch.compile(flex_attention, dynamic=False)
@@ -436,10 +437,20 @@ x, y = train_loader.next_batch()
 # this originates from Karpathy's experiments.
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+# Cast the model to mixed bfloat16, float32, & float8 precision; suggested by @leloykun
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
         m.float()
+def module_filter_fn(module: nn.Module, name: str) -> bool:
+    if name in ["wte", "lm_head"]:
+        return False
+    if isinstance(module, nn.Linear):
+        if module.in_features % 16 != 0 or module.out_features % 16 != 0:
+            return False
+    return True
+convert_to_float8_training(model, module_filter_fn=module_filter_fn)
+
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
