@@ -138,7 +138,7 @@ class CastedLinear(nn.Linear):
 
 class Rotary(torch.nn.Module):
 
-    def __init__(self, dim: int, base: int = 100000):
+    def __init__(self, dim: int, base: int = 10000):
         super().__init__()
         self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
         self.seq_len_cached = None
@@ -261,9 +261,15 @@ class GPT(nn.Module):
             document_mask = docs[q_idx] == docs[kv_idx]
             window_mask = q_idx - kv_idx < attn_blocksize
             return causal_mask & document_mask & window_mask
+        def document_causal_mask_local(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            window_mask = q_idx - kv_idx < attn_blocksize//2
+            return causal_mask & document_mask & window_mask
 
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
+        block_mask_local = create_block_mask(document_causal_mask_local, None, None, S, S, device="cuda", _compile=True)
 
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
@@ -275,14 +281,14 @@ class GPT(nn.Module):
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
             vi = self.transformer.vte[i](idx[None])
-            x = self.transformer.h[i](x, vi, x0, block_mask)
+            x = self.transformer.h[i](x, vi, x0, block_mask if i % 2 == 0 else block_mask_local)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             # U-net structure on token value embeddings by @leloykun
             vi = self.transformer.vte[self.num_encoder_layers-1-i](idx[None])
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.transformer.h[self.num_encoder_layers + i](x, vi, x0, block_mask)
+            x = self.transformer.h[self.num_encoder_layers + i](x, vi, x0, block_mask if i % 2 == 0 else block_mask_local)
 
         x = norm(x)
         logits = self.lm_head(x)
