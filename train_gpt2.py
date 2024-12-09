@@ -247,7 +247,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
             # U-net structure on token value embeddings by @leloykun
-            vte = nn.ModuleList([nn.Embedding(config.vocab_size, config.n_embd) for _ in range(self.num_encoder_layers)]),
+            vte = nn.ModuleList([nn.Embedding(config.vocab_size, config.n_embd) for _ in range(self.num_encoder_layers//2)]),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
@@ -274,13 +274,13 @@ class GPT(nn.Module):
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
-            vi = self.transformer.vte[i](idx[None])
+            vi = self.transformer.vte[i//2](idx[None])
             x = self.transformer.h[i](x, vi, x0, block_mask)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             # U-net structure on token value embeddings by @leloykun
-            vi = self.transformer.vte[self.num_encoder_layers-1-i](idx[None])
+            vi = self.transformer.vte[(self.num_encoder_layers-1-i)//2](idx[None])
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.transformer.h[self.num_encoder_layers + i](x, vi, x0, block_mask)
 
