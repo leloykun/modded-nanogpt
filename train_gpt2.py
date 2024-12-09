@@ -247,23 +247,13 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
             # U-net structure on token value embeddings by @leloykun
-            vte = nn.ModuleList([nn.Embedding(config.vocab_size, config.n_embd) for _ in range(self.num_encoder_layers//2)]),
+            vte = nn.ModuleList([nn.Embedding(config.vocab_size, config.n_embd) for _ in range(self.num_encoder_layers)]),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx: torch.Tensor, target: torch.Tensor, attn_blocksize: torch.Tensor) -> torch.Tensor:
-
-        docs = (idx == 50256).cumsum(0)
-        def document_causal_mask(b, h, q_idx, kv_idx):
-            causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
-            window_mask = q_idx - kv_idx < attn_blocksize
-            return causal_mask & document_mask & window_mask
-
-        S = len(idx)
-        block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
+    def forward(self, idx: torch.Tensor, target: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
 
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
@@ -274,13 +264,13 @@ class GPT(nn.Module):
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
-            vi = self.transformer.vte[i//2](idx[None])
+            vi = self.transformer.vte[i](idx[None])
             x = self.transformer.h[i](x, vi, x0, block_mask)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             # U-net structure on token value embeddings by @leloykun
-            vi = self.transformer.vte[(self.num_encoder_layers-1-i)//2](idx[None])
+            vi = self.transformer.vte[self.num_encoder_layers-1-i](idx[None])
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.transformer.h[self.num_encoder_layers + i](x, vi, x0, block_mask)
 
@@ -507,7 +497,14 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 x_val, y_val = val_loader.next_batch()
-                val_loss += model(x_val, y_val, attn_blocksize=attn_blocksize)
+                docs_val = (x_val == 50256).cumsum(0)
+                def document_causal_mask(b, h, q_idx, kv_idx):
+                    causal_mask = q_idx >= kv_idx
+                    document_mask = docs_val[q_idx] == docs_val[kv_idx]
+                    window_mask = q_idx - kv_idx < attn_blocksize
+                    return causal_mask & document_mask & window_mask
+                block_mask = create_block_mask(document_causal_mask, None, None, T, T, device="cuda", _compile=True)
+                val_loss += model(x_val, y_val, block_mask)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
@@ -534,11 +531,25 @@ for step in range(args.num_iterations + 1):
     if last_step:
         break
 
+    # stop the clock
+    torch.cuda.synchronize()
+    training_time_ms += 1000 * (time.time() - t0)
+    docs = (x == 50256).cumsum(0)
+    def document_causal_mask(b, h, q_idx, kv_idx):
+        causal_mask = q_idx >= kv_idx
+        document_mask = docs[q_idx] == docs[kv_idx]
+        window_mask = q_idx - kv_idx < attn_blocksize
+        return causal_mask & document_mask & window_mask
+    block_mask = create_block_mask(document_causal_mask, None, None, T, T, device="cuda", _compile=True)
+    # start the clock again
+    torch.cuda.synchronize()
+    t0 = time.time()
+
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     if train_accumulation_steps == 1:
         # forward pass
-        loss: torch.Tensor = model(x, y, attn_blocksize=attn_blocksize)
+        loss: torch.Tensor = model(x, y, block_mask)
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         # backward pass
@@ -548,7 +559,7 @@ for step in range(args.num_iterations + 1):
             ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
             with ctx: # there's no need to sync gradients every accumulation step
                 # forward pass
-                loss: torch.Tensor = model(x, y, attn_blocksize=attn_blocksize)
+                loss: torch.Tensor = model(x, y, block_mask)
                 # advance the dataset for the next batch
                 x, y = train_loader.next_batch()
                 # backward pass
