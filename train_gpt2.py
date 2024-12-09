@@ -138,7 +138,7 @@ class CastedLinear(nn.Linear):
 
 class Rotary(torch.nn.Module):
 
-    def __init__(self, dim: int, base: int = 10000):
+    def __init__(self, dim: int, base: int = 100000):
         super().__init__()
         self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
         self.seq_len_cached = None
@@ -253,7 +253,17 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx: torch.Tensor, target: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, target: torch.Tensor, attn_blocksize: torch.Tensor) -> torch.Tensor:
+
+        docs = (idx == 50256).cumsum(0)
+        def document_causal_mask(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            window_mask = q_idx - kv_idx < attn_blocksize
+            return causal_mask & document_mask & window_mask
+
+        S = len(idx)
+        block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
 
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
@@ -497,14 +507,7 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 x_val, y_val = val_loader.next_batch()
-                docs_val = (x_val == 50256).cumsum(0)
-                def document_causal_mask(b, h, q_idx, kv_idx):
-                    causal_mask = q_idx >= kv_idx
-                    document_mask = docs_val[q_idx] == docs_val[kv_idx]
-                    window_mask = q_idx - kv_idx < attn_blocksize
-                    return causal_mask & document_mask & window_mask
-                block_mask = create_block_mask(document_causal_mask, None, None, T, T, device="cuda", _compile=True)
-                val_loss += model(x_val, y_val, block_mask)
+                val_loss += model(x_val, y_val, attn_blocksize=attn_blocksize)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
@@ -531,25 +534,11 @@ for step in range(args.num_iterations + 1):
     if last_step:
         break
 
-    # stop the clock
-    torch.cuda.synchronize()
-    training_time_ms += 1000 * (time.time() - t0)
-    docs = (x == 50256).cumsum(0)
-    def document_causal_mask(b, h, q_idx, kv_idx):
-        causal_mask = q_idx >= kv_idx
-        document_mask = docs[q_idx] == docs[kv_idx]
-        window_mask = q_idx - kv_idx < attn_blocksize
-        return causal_mask & document_mask & window_mask
-    block_mask = create_block_mask(document_causal_mask, None, None, T, T, device="cuda", _compile=True)
-    # start the clock again
-    torch.cuda.synchronize()
-    t0 = time.time()
-
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     if train_accumulation_steps == 1:
         # forward pass
-        loss: torch.Tensor = model(x, y, block_mask)
+        loss: torch.Tensor = model(x, y, attn_blocksize=attn_blocksize)
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         # backward pass
@@ -559,7 +548,7 @@ for step in range(args.num_iterations + 1):
             ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
             with ctx: # there's no need to sync gradients every accumulation step
                 # forward pass
-                loss: torch.Tensor = model(x, y, block_mask)
+                loss: torch.Tensor = model(x, y, attn_blocksize=attn_blocksize)
                 # advance the dataset for the next batch
                 x, y = train_loader.next_batch()
                 # backward pass
