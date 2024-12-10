@@ -519,6 +519,20 @@ for step in range(args.num_iterations + 1):
         val_loss /= val_steps
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        if master_process:
+            print0("============== Weight norms: ==============")
+            for name, p in model.named_parameters():
+                if p.ndim != 2:
+                    continue
+                frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
+                spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
+                median_sv = torch.median(p.data.float().svd(compute_uv=False).S).item()
+                if "embed" in name:
+                    l1_to_l2_norm = torch.norm(p.data.float(), p=2, dim=1).mean().item()
+                    print0(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.5f} | {l1_to_l2_norm = :.5f}")
+                else:
+                    print0(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.5f}")
+            print0("===========================================")
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -553,6 +567,22 @@ for step in range(args.num_iterations + 1):
     if train_accumulation_steps != 1:
         for p in model.parameters():
             p.grad /= train_accumulation_steps
+    if master_process and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        print0("============== Gradient norms: ==============")
+        for name, p in model.named_parameters():
+            if p.ndim != 2:
+                continue
+            if p.grad is None:
+                continue
+            frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
+            spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
+            median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item()
+            if "embed" in name:
+                l1_to_l2_norm = torch.norm(p.grad.float(), p=2, dim=1).mean().item()
+                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.5f} | {l1_to_l2_norm = :.5f}")
+            else:
+                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.5f}")
+        print0("===========================================")
     # momentum warmup for Muon
     frac = min(step/300, 1)
     for group in optimizer3.param_groups:
