@@ -531,7 +531,7 @@ for step in range(args.num_iterations + 1):
                     frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
                     spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
                     median_sv = torch.median(p.data.float().svd(compute_uv=False).S).item()
-                    print0(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.7f}")
+                    print0(f"W {name = } | {median_sv = :.7f} | {spectral_norm = :.5f} | {frobenius_norm = :.5f}")
             print0("===========================================")
         # start the clock again
         torch.cuda.synchronize()
@@ -588,7 +588,8 @@ for step in range(args.num_iterations + 1):
                 gram4 = gram2 @ gram2.T
                 frobenius_norm4 = torch.linalg.norm(gram4, ord='fro').item()
                 spectral_norm_est_t4 = frobenius_norm4 ** (0.25)
-                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.7f} | {spectral_norm_est_t2 = :.7f} | {spectral_norm_est_t4 = :.7f}")
+                print0(f"G {name = } | {median_sv = :.7f} | {spectral_norm = :.5f} | {frobenius_norm = :.7f} | {spectral_norm_est_t2 = :.7f} | {spectral_norm_est_t4 = :.7f}")
+                print0(f"- {name = } | {median_sv/spectral_norm = :.7f} | {median_sv/frobenius_norm = :.7f} | {median_sv/spectral_norm_est_t2 = :.7f} | {median_sv/spectral_norm_est_t4 = :.7f}")
         print0("===========================================")
     # momentum warmup for Muon
     frac = min(step/300, 1)
