@@ -37,7 +37,7 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps=10, eps=1e-7):
     if G.size(0) > G.size(1):
         X = X.T
     A = X @ X.T
-    bound = A.norm() ** 0.5 + eps
+    bound = A.norm().item() ** 0.5 + eps
     B = (b / bound) * A + (c / bound) * A @ A
     X = (a / bound) * X + B @ X
     for _ in range(steps - 1):
