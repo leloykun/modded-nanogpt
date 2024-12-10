@@ -581,11 +581,11 @@ for step in range(args.num_iterations + 1):
                 frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
                 spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
                 median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item()
-                gram2 = p.grad.T @ p.grad
-                frobenius_norm2 = torch.linalg.norm(gram2.float(), ord='fro').item()
+                gram2 = p.grad.float().T @ p.grad.float()
+                frobenius_norm2 = torch.linalg.norm(gram2, ord='fro').item()
                 gram4 = gram2.T @ gram2
-                frobenius_norm4 = torch.linalg.norm(gram4.float(), ord='fro').item()
-                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.7f} | {frobenius_norm2 = :.5f} | {frobenius_norm4 = :.5f}")
+                frobenius_norm4 = torch.linalg.norm(gram4, ord='fro').item()
+                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.7f} | {frobenius_norm2 = :.7f} | {frobenius_norm4 = :.7f}")
             else:
                 frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
                 spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
