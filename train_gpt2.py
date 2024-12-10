@@ -577,22 +577,18 @@ for step in range(args.num_iterations + 1):
             if "embed" in name:
                 l1_to_l2_norm = torch.norm(p.grad.float(), p=2, dim=1).mean().item()
                 print0(f"G {name = } | {l1_to_l2_norm = :.5f}")
-            elif p.size(0) == p.size(1):
-                frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
-                spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
-                median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item()
-                gram2 = p.grad.float().T @ p.grad.float()
-                frobenius_norm2 = torch.linalg.norm(gram2, ord='fro').item()
-                spectral_norm_est_t2 = frobenius_norm2 ** (0.5)
-                gram4 = gram2.T @ gram2
-                frobenius_norm4 = torch.linalg.norm(gram4, ord='fro').item()
-                spectral_norm_est_t4 = frobenius_norm4 ** (0.25)
-                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.7f} | {spectral_norm_est_t2 = :.7f} | {spectral_norm_est_t4 = :.7f}")
             else:
                 frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
                 spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
                 median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item()
-                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.7f}")
+                gram1 = p.grad.float() if p.size(0) <= p.size(1) else p.grad.float().T
+                gram2 = gram1 @ gram1.T
+                frobenius_norm2 = torch.linalg.norm(gram2, ord='fro').item()
+                spectral_norm_est_t2 = frobenius_norm2 ** (0.5)
+                gram4 = gram2 @ gram2.T
+                frobenius_norm4 = torch.linalg.norm(gram4, ord='fro').item()
+                spectral_norm_est_t4 = frobenius_norm4 ** (0.25)
+                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.7f} | {spectral_norm_est_t2 = :.7f} | {spectral_norm_est_t4 = :.7f}")
         print0("===========================================")
     # momentum warmup for Muon
     frac = min(step/300, 1)
