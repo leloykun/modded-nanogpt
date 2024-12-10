@@ -34,10 +34,13 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
-    for _ in range(steps):
+    A = X @ X.T
+    bound = A.norm() ** 0.5
+    B = (b / bound) * A + (c / bound) * A @ A
+    X = (a / bound) * X + B @ X
+    for _ in range(steps - 1):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
@@ -383,6 +386,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    log_norms: bool = False # log the norms of the weights and gradients
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -519,7 +523,7 @@ for step in range(args.num_iterations + 1):
         val_loss /= val_steps
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
-        if master_process:
+        if args.log_norms and master_process:
             print0("============== Weight norms: ==============")
             for name, p in model.named_parameters():
                 if p.ndim != 2:
@@ -567,7 +571,7 @@ for step in range(args.num_iterations + 1):
     if train_accumulation_steps != 1:
         for p in model.parameters():
             p.grad /= train_accumulation_steps
-    if master_process and step != 0 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+    if args.log_norms and master_process and step != 0 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         print0("============== Gradient norms: ==============")
         for name, p in model.named_parameters():
             if p.ndim != 2:
