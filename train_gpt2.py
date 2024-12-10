@@ -23,7 +23,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._dynamo.config.capture_scalar_outputs = True
 
 @torch.compile
-def zeropower_via_newtonschulz5(G: torch.Tensor, steps=10, eps=1e-7):
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -42,7 +42,7 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps=10, eps=1e-7):
     a_norm = A.norm()
     A /= a_norm + eps
     B = b * A + c * A @ A
-    X = (a / (a_norm.item()**0.5 + eps)) * X + B @ X
+    X = a * (X / (a_norm**0.5 + eps)) + B @ X
     for _ in range(steps - 1):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
