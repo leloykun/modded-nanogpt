@@ -531,7 +531,7 @@ for step in range(args.num_iterations + 1):
                     frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
                     spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
                     median_sv = torch.median(p.data.float().svd(compute_uv=False).S).item()
-                    print0(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.5f}")
+                    print0(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.7f}")
             print0("===========================================")
         # start the clock again
         torch.cuda.synchronize()
@@ -577,11 +577,20 @@ for step in range(args.num_iterations + 1):
             if "embed" in name:
                 l1_to_l2_norm = torch.norm(p.grad.float(), p=2, dim=1).mean().item()
                 print0(f"G {name = } | {l1_to_l2_norm = :.5f}")
+            elif p.size(0) == p.size(1):
+                frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
+                spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
+                median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item()
+                gram2 = p.grad.T @ p.grad
+                frobenius_norm2 = torch.linalg.norm(gram2.float(), ord='fro').item()
+                gram4 = gram2.T @ gram2
+                frobenius_norm4 = torch.linalg.norm(gram4.float(), ord='fro').item()
+                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.7f} | {frobenius_norm2 = :.5f} | {frobenius_norm4 = :.5f}")
             else:
                 frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
                 spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
                 median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item()
-                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.5f}")
+                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.7f}")
         print0("===========================================")
     # momentum warmup for Muon
     frac = min(step/300, 1)
