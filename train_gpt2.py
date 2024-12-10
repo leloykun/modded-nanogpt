@@ -530,7 +530,7 @@ for step in range(args.num_iterations + 1):
                 else:
                     frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
                     spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
-                    median_sv = torch.median(p.data.float().svd(compute_uv=False).S).item()
+                    median_sv = torch.median(p.data.float().svd(compute_uv=False).S).item() + 1e-8
                     print0(f"W {name = } | {median_sv = :.7f} | {spectral_norm = :.5f} | {frobenius_norm = :.5f}")
             print0("===========================================")
         # start the clock again
@@ -567,7 +567,7 @@ for step in range(args.num_iterations + 1):
     if train_accumulation_steps != 1:
         for p in model.parameters():
             p.grad /= train_accumulation_steps
-    if master_process and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+    if master_process and step != 0 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         print0("============== Gradient norms: ==============")
         for name, p in model.named_parameters():
             if p.ndim != 2:
@@ -580,7 +580,7 @@ for step in range(args.num_iterations + 1):
             else:
                 frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
                 spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
-                median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item()
+                median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item() + 1e-8
                 gram1 = p.grad.float() if p.size(0) <= p.size(1) else p.grad.float().T
                 gram2 = gram1 @ gram1.T
                 frobenius_norm2 = torch.linalg.norm(gram2, ord='fro').item()
