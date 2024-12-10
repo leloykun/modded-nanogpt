@@ -42,7 +42,8 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     a_norm = A.norm()
     A /= a_norm + eps
     B = b * A + c * A @ A
-    X = a * (X / (a_norm**0.5 + eps)) + B @ X
+    X /= a_norm**0.5 + eps
+    X = a * X + B @ X
     for _ in range(steps - 1):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
