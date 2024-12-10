@@ -524,13 +524,13 @@ for step in range(args.num_iterations + 1):
             for name, p in model.named_parameters():
                 if p.ndim != 2:
                     continue
-                frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
-                spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
-                median_sv = torch.median(p.data.float().svd(compute_uv=False).S).item()
                 if "embed" in name:
                     l1_to_l2_norm = torch.norm(p.data.float(), p=2, dim=1).mean().item()
-                    print0(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.5f} | {l1_to_l2_norm = :.5f}")
+                    print0(f"W {name = } | {l1_to_l2_norm = :.5f}")
                 else:
+                    frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
+                    spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
+                    median_sv = torch.median(p.data.float().svd(compute_uv=False).S).item()
                     print0(f"W {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.5f}")
             print0("===========================================")
         # start the clock again
@@ -574,13 +574,13 @@ for step in range(args.num_iterations + 1):
                 continue
             if p.grad is None:
                 continue
-            frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
-            spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
-            median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item()
             if "embed" in name:
                 l1_to_l2_norm = torch.norm(p.grad.float(), p=2, dim=1).mean().item()
-                print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.5f} | {l1_to_l2_norm = :.5f}")
+                print0(f"G {name = } | {l1_to_l2_norm = :.5f}")
             else:
+                frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
+                spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
+                median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item()
                 print0(f"G {name = } | {frobenius_norm = :.5f} | {spectral_norm = :.5f} | {median_sv = :.5f}")
         print0("===========================================")
     # momentum warmup for Muon
