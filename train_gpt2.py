@@ -39,10 +39,10 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps=10, eps=1e-7):
     if G.size(0) > G.size(1):
         X = X.T
     A = X @ X.T
-    bound = A.norm() ** 0.5 + eps
-    A /= bound ** 2
+    a_norm = A.norm()
+    A /= a_norm + eps
     B = b * A + c * A @ A
-    X = a * (X / bound) + B @ X
+    X = (a / (a_norm.item()**0.5 + eps)) * X + B @ X
     for _ in range(steps - 1):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
