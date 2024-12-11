@@ -640,6 +640,7 @@ for step in range(args.num_iterations + 1):
                 spectral_norm_est_t4 = frobenius_norm4 ** (0.25)
                 print0(f"G {name = } | {median_sv = :.7f} | {spectral_norm = :.7f} | {frobenius_norm = :.7f} | {spectral_norm_est_t2 = :.7f} | {spectral_norm_est_t4 = :.7f}")
         torch.save(log, "logs/%s/grad_state_step%06d.pt" % (run_id, step))
+        print0("saved grads to logs/%s/grad_state_step%06d.pt" % (run_id, step))
         print0("===========================================")
         # start the clock again
         torch.cuda.synchronize()
