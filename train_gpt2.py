@@ -342,12 +342,12 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, vi[self.num_encoder_layers-1-i], x0, block_mask)
 
         x = norm(x)
-        loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=50256, softcap=30.0)
-        loss = loss_fn(self.lm_head.weight, x, targets)
-        # logits = self.lm_head(x)
-        # logits = 30 * torch.tanh(logits / 30) # @Grad62304977
-        # logits = logits.float()
-        # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        logits = self.lm_head(x)
+        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = logits.float()
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        # loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=50256, softcap=30.0)
+        # loss = loss_fn(self.lm_head.weight, x, targets)
         return loss
 
 # -----------------------------------------------------------------------------
