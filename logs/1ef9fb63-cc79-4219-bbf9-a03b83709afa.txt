@@ -1,0 +1,1688 @@
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import time
+import contextlib
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+import torch.distributed as dist
+import torch._inductor.config as config
+from torch.nn.parallel import DistributedDataParallel as DDP
+# Use of FlexAttention contributed by @KoszarskyB
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
+
+
+class LigerFusedLinearCrossEntropyLoss(torch.nn.Module):
+    def __init__(
+        self,
+        ignore_index: int = -100,
+        lse_square_scale: float = 0.0,
+        label_smoothing: float = 0.0,
+        reduction: str = "mean",
+        softcap: float | None = None,
+    ):
+        super().__init__()
+        assert (label_smoothing >= 0) and (
+            label_smoothing <= 1
+        ), f"label_smoothing must be between 0.0 and 1.0. Got: {label_smoothing}"
+        assert reduction in {
+            "mean",
+            "sum",
+            "none",
+        }, f"reduction must be one of 'mean', 'sum', or 'none'. Got: {reduction}"
+        assert (
+            softcap is None or softcap > 0
+        ), f"softcap must greater than 0.0 or None. Got: {softcap}"
+        self.ignore_index = ignore_index
+        self.lse_square_scale = lse_square_scale
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+        self.softcap = softcap
+
+    def forward(self, lin_weight, _input, target, bias=None):
+        return LigerFusedLinearCrossEntropyFunction.apply(
+            _input,
+            lin_weight,
+            target,
+            bias,
+            self.ignore_index,
+            self.lse_square_scale,
+            self.label_smoothing,
+            self.reduction,
+            self.softcap,
+        )
+
+# -----------------------------------------------------------------------------
+# Muon optimizer
+
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iteration steps to use.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+        self.world_size = int(os.environ['WORLD_SIZE'])
+        self.rank = int(os.environ['RANK'])
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        params = list(params)
+        assert all(isinstance(p, torch.Tensor) for p in params)
+        sizes = {p.numel() for p in params}
+        param_groups = [
+            {
+                'params': [p for p in params if p.numel() == size],
+                'update_buffer': [
+                    torch.empty(size, device='cuda', dtype=torch.bfloat16)
+                    for _ in range(self.world_size)
+                ],
+            }
+            for size in sizes
+        ]
+        super().__init__(param_groups, defaults)
+
+    def step(self):
+
+        for group in self.param_groups:
+
+            lr = group['lr']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            ns_steps = group['ns_steps']
+            update_buffers = group['update_buffer']
+            # generate weight updates in distributed fashion
+            params = group['params']
+            assert len(params) % self.world_size == 0
+            handle = None
+            params_world = None
+            def update_prev():
+                if params_world is None:
+                    return
+                assert handle is not None
+                handle.wait()
+                for p_world, g_world in zip(params_world, update_buffers):
+                    p_world.data.add_(
+                        g_world.view_as(p_world),
+                        alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
+                    )
+            for base_i in range(len(params))[::self.world_size]:
+                p = params[base_i + self.rank]
+                g = p.grad
+                assert g is not None
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.lerp_(g, 1 - momentum)
+                g = g.lerp_(buf, momentum) if nesterov else buf
+                g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                update_prev()
+                handle = dist.all_gather(update_buffers, g, async_op=True)
+                params_world = params[base_i : base_i + self.world_size]
+            update_prev()
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the GPT-2 model
+
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
+
+class CastedLinear(nn.Linear):
+
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=False)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.to(x.dtype))
+
+class Rotary(torch.nn.Module):
+
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            t = torch.arange(seq_len, device=x.device)
+            freqs = torch.outer(t, self.inv_freq)
+            self.seq_len_cached = seq_len
+            self.cos_cached = freqs.cos()
+            self.sin_cached = freqs.sin()
+        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        # apply_rotary_emb(x, cos, sin)
+        x1, x2 = x.chunk(2, dim=3)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x)
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.c_q = CastedLinear(dim, dim)
+        self.c_k = CastedLinear(dim, dim)
+        self.c_v = CastedLinear(dim, dim)
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
+        self.c_proj = CastedLinear(dim, dim)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x, vi, block_mask):
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+        q = self.c_q(x).view(B, T, self.num_heads, -1)
+        k = self.c_k(x).view(B, T, self.num_heads, -1)
+        v = self.c_v(x).view(B, T, self.num_heads, -1)
+        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q), self.rotary(k)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+
+    def __init__(self, dim):
+        super().__init__()
+        self.c_fc   = CastedLinear(dim, 4 * dim)
+        self.c_proj = CastedLinear(4 * dim, dim)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config.model_dim, config.num_heads)
+        self.mlp = MLP(config.model_dim)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
+    def forward(self, x, vi, x0, block_mask):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x = x + self.attn(norm(x), vi, block_mask)
+        x = x + self.mlp(norm(x))
+        return x
+
+# -----------------------------------------------------------------------------
+# The main GPT-2 model
+
+@dataclass
+class GPTConfig:
+    vocab_size : int = 50304
+    num_layers : int = 12
+    num_heads : int = 6 # head dim 128 suggested by @Grad62304977
+    model_dim : int = 768
+
+class GPT(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_layers = config.num_layers
+
+        # U-net design by @brendanh0gan
+        self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
+        self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+
+        self.embed = nn.Embedding(config.vocab_size, config.model_dim)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
+        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
+        # U-net structure on token value embeddings by @leloykun
+        self.value_embeds = nn.Embedding(config.vocab_size, config.model_dim*self.num_encoder_layers)
+        self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
+        self.lm_head.weight.data.zero_() # @Grad62304977
+
+    def forward(self, inputs, targets, sliding_window_size):
+
+        BLOCK_SIZE = 128
+        assert inputs.ndim == 1
+        docs = (inputs == 50256).cumsum(0)
+        docs_low = docs.reshape(-1, BLOCK_SIZE)[:, 0].contiguous()
+        docs_high = docs.reshape(-1, BLOCK_SIZE)[:, -1].contiguous()
+        def document_sliding_window_causal(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            window_mask = q_idx - kv_idx < sliding_window_size
+            return causal_mask & document_mask & window_mask
+
+        S = len(inputs)
+        def create_sliding_window_causal_mask(S, sliding_window_size):
+            kv_idx = block_idx = torch.arange(S // BLOCK_SIZE, dtype=torch.int32, device="cuda")
+            q_idx = block_idx[:, None]
+            causal_mask = q_idx >= kv_idx
+            document_mask = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
+            window_mask = q_idx - kv_idx < ((sliding_window_size + BLOCK_SIZE - 1) // BLOCK_SIZE)
+            dense_mask = causal_mask & document_mask & window_mask
+            dense_mask = dense_mask.to(torch.int32)
+            num_blocks = dense_mask.sum(dim=-1).to(torch.int32)
+            indices = torch.argsort(dense_mask, dim=-1, descending=True, stable=True).to(torch.int32)
+            num_blocks = num_blocks[None, None, :].contiguous()
+            indices = indices[None, None, :].contiguous()
+            return BlockMask.from_kv_blocks(num_blocks, indices, BLOCK_SIZE=BLOCK_SIZE, mask_mod=document_sliding_window_causal)
+        block_mask = create_sliding_window_causal_mask(S, sliding_window_size)
+
+        # forward the GPT model itself
+        x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
+        x = norm(x) # @Grad62304977
+        x0 = x
+        vi = self.value_embeds(inputs[None]).chunk(self.num_encoder_layers, dim=-1)
+
+        # Store outputs for U-Net skip connections
+        skip_connections = []
+        # Encoder pass - process only the first half of the blocks
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, vi[i], x0, block_mask)
+            skip_connections.append(x)
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        for i in range(self.num_decoder_layers):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            # U-net structure on token value embeddings by @leloykun
+            x = self.blocks[self.num_encoder_layers + i](x, vi[self.num_encoder_layers-1-i], x0, block_mask)
+
+        x = norm(x)
+        logits = self.lm_head(x)
+        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = logits.float()
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        # loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=50256, softcap=30.0)
+        # loss = loss_fn(self.lm_head.weight, x, targets)
+        return loss
+
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _peek_data_shard(file: Path):
+    # only reads the header, returns header data
+    # header is 256 int32
+    header = torch.from_file(f"{file}", False, 256, dtype=torch.int32)
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    return int(header[2]) # number of tokens (claimed)
+
+def _load_data_shard(path, num_tokens):
+    with path.open("rb") as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy())
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedDataLoader:
+    def __init__(self, filename_pattern, seq_len, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.seq_len = seq_len
+
+        # glob files that match the pattern
+        self.files = sorted(Path.cwd().glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        self.files_num_tokens = [_peek_data_shard(file) for file in self.files]
+        assert min(self.files_num_tokens) >= num_processes * seq_len + 1
+        self.total_num_tokens = sum(self.files_num_tokens)
+
+        self.reset()
+
+    def reset(self):
+        self.current_shard = -1
+        self.advance()
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.seq_len
+        self.tokens = _load_data_shard(self.files[self.current_shard], self.files_num_tokens[self.current_shard])
+
+    def next_batch(self):
+        batch_size = self.seq_len * self.num_processes
+        buf = self.tokens[self.current_position:self.current_position+self.seq_len+1]
+        # host side async is sufficient;
+        # no performance improvement was observed when introducing a separate stream.
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # targets
+        # advance current position and load next shard if necessary
+        self.current_position += batch_size
+        if self.current_position + batch_size + 1 >= len(self.tokens):
+            self.advance()
+        return inputs, targets
+
+# -----------------------------------------------------------------------------
+# int main
+
+@dataclass
+class Hyperparameters:
+    # data hyperparams
+    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    # optimization hyperparams
+    batch_size : int = 8 # batch size, in sequences, across all devices
+    sequence_length : int = 64*1024 # sequence length, in tokens
+    num_iterations : int = 1480 # number of iterations to run
+    warmup_iters : int = 0
+    cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    weight_decay : float = 0
+    # evaluation and logging hyperparams
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    log_norms: bool = True # log the norms of the weights and gradients
+args = Hyperparameters()
+
+# set up DDP (distributed data parallel). torchrun sets this env variable
+assert torch.cuda.is_available()
+dist.init_process_group(backend='nccl')
+ddp_rank = int(os.environ['RANK'])
+ddp_local_rank = int(os.environ['LOCAL_RANK'])
+ddp_world_size = int(os.environ['WORLD_SIZE'])
+device = f'cuda:{ddp_local_rank}'
+torch.cuda.set_device(device)
+print(f"using device: {device}")
+master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+
+# begin logging
+logfile = None
+if master_process:
+    run_id = str(uuid.uuid4())
+    logdir = 'logs/%s/' % run_id
+    os.makedirs(logdir, exist_ok=True)
+    logfile = 'logs/%s.txt' % run_id
+    # create the log file
+    with open(logfile, "w") as f:
+        # begin the log by printing this file (the Python code)
+        f.write(code)
+        f.write('='*100 + '\n')
+def print0(s, logonly=False):
+    if master_process:
+        with open(logfile, "a") as f:
+            if not logonly:
+                print(s)
+            f.write(s+'\n')
+# log information about the hardware/software environment this is running on
+# and print the full `nvidia-smi` to file
+print0(f"Running python {sys.version}")
+print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
+import subprocess
+result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+print0(f'{result.stdout}', logonly=True)
+print0('='*100, logonly=True)
+
+# calculate the number of steps to take in the val loop.
+assert args.val_tokens % (args.sequence_length * ddp_world_size) == 0
+val_steps = args.val_tokens // (args.sequence_length * ddp_world_size)
+# calculate the steps of gradient accumulation required to attain the desired global batch size.
+assert args.batch_size % (ddp_world_size) == 0
+train_accumulation_steps = args.batch_size // ddp_world_size
+
+# load tokens
+train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp_rank, ddp_world_size)
+print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
+print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
+print0('='*100, logonly=True)
+inputs_train, targets_train = train_loader.next_batch()
+
+# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+# this originates from Karpathy's experiments.
+num_vocab = 50304
+model = GPT(GPTConfig(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768))
+model = model.cuda().bfloat16()
+for m in model.modules():
+    if isinstance(m, CastedLinear):
+        m.float()
+if hasattr(config, "coordinate_descent_tuning"):
+    config.coordinate_descent_tuning = True # suggested by @Chillee
+model = torch.compile(model)
+# here we wrap model into DDP container
+model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module # always contains the "raw" unwrapped model
+
+# init the optimizer(s)
+optimizer1 = torch.optim.Adam([raw_model.embed.weight, raw_model.value_embeds.weight], lr=0.6, betas=(0.8, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
+params = list(raw_model.blocks.parameters())
+matrix_params = [p for p in params if p.ndim == 2]
+scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+# learning rate decay scheduler (linear warmup and cooldown)
+def get_lr(it):
+    assert it <= args.num_iterations
+    # 1) linear warmup for warmup_iters steps
+    if it < args.warmup_iters:
+        return (it+1) / args.warmup_iters
+    # 2) constant lr for a while
+    elif it < args.num_iterations - args.cooldown_iters:
+        return 1.0
+    # 3) linear cooldown
+    else:
+        decay_ratio = (args.num_iterations - it) / args.cooldown_iters
+        return decay_ratio
+schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+sliding_window_size = torch.tensor(64, dtype=torch.int32, device="cuda")
+sw_size_prev = 64
+# Start training loop
+training_time_ms = 0
+# start the clock
+torch.cuda.synchronize()
+t0 = time.perf_counter()
+# begin training
+for step in range(args.num_iterations + 1):
+    last_step = (step == args.num_iterations)
+    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+    # steps with dummy data first, and then re-initialize the model and reset the loader.
+    if step == 10:
+        training_time_ms = 0
+        t0 = time.perf_counter()
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+    # Linearly increase the sliding window size over training in chunks of 64 from 64 -> 1792. By @fernbear.bsky.social
+    frac_done = step / args.num_iterations # training progress
+    sw_size = 64 * (((1 - frac_done) * 64 + frac_done * 1792) // 64)
+    if sw_size != sw_size_prev:
+        sliding_window_size.copy_(sw_size, non_blocking=True)
+        sw_size_prev = sw_size
+
+    # once in a while evaluate the validation dataset
+    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
+        # run validation batches
+        model.eval()
+        val_loader.reset()
+        val_loss = 0.0
+        for _ in range(val_steps):
+            with torch.no_grad():
+                inputs_val, targets_val = val_loader.next_batch()
+                val_loss += model(inputs_val, targets_val, sliding_window_size)
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        val_loss /= val_steps
+        # log val loss to console and to logfile
+        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        if args.log_norms and master_process:
+            print0("============== Weight norms: ==============")
+            for name, p in model.named_parameters():
+                if p.ndim != 2:
+                    continue
+                if "embed" in name:
+                    l1_to_l2_norm = torch.norm(p.data.float(), p=2, dim=1).mean().item()
+                    print0(f"W {name = } | {l1_to_l2_norm = :.7f}")
+                else:
+                    frobenius_norm = torch.linalg.norm(p.data.float(), ord='fro').item()
+                    spectral_norm = torch.linalg.matrix_norm(p.data.float(), ord=2).item()
+                    median_sv = torch.median(p.data.float().svd(compute_uv=False).S).item() + 1e-8
+                    print0(f"W {name = } | {median_sv = :.7f} | {spectral_norm = :.7f} | {frobenius_norm = :.7f}")
+            print0("===========================================")
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+    # if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+    #     # stop the clock
+    #     torch.cuda.synchronize()
+    #     training_time_ms += 1000 * (time.perf_counter() - t0)
+    #     # save the state of the training process
+    #     log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+    #     torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+    #     # start the clock again
+    #     torch.cuda.synchronize()
+    #     t0 = time.perf_counter()
+
+    # bit confusing: we want to make sure to eval on 0th iteration
+    # but also after the very last iteration. so we loop for step <= num_iterations
+    # instead of just < num_iterations (one extra due to <=), only to do
+    # the validation/sampling one last time, and then we break right here as we're done.
+    if last_step:
+        break
+
+    # --------------- TRAINING SECTION BEGIN -----------------
+    model.train()
+    for i in range(1, train_accumulation_steps+1):
+        ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
+        with ctx: # there's no need to sync gradients every accumulation step
+            loss = model(inputs_train, targets_train, sliding_window_size)
+            loss.backward()
+            del loss
+            inputs_train, targets_train = train_loader.next_batch()
+    if train_accumulation_steps != 1:
+        for p in model.parameters():
+            p.grad /= train_accumulation_steps
+    if args.log_norms and master_process and step != 0 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
+        print0("============== Gradient norms: ==============")
+        log = dict()
+        for name, p in model.named_parameters():
+            if p.ndim != 2:
+                continue
+            if p.grad is None:
+                continue
+            if "embed" in name:
+                l1_to_l2_norm = torch.norm(p.grad.float(), p=2, dim=1).mean().item()
+                print0(f"G {name = } | {l1_to_l2_norm = :.7f}")
+            else:
+                frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
+                spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
+                S = p.grad.float().svd(compute_uv=False).S
+                log[name] = S
+                median_sv = torch.median(S).item() + 1e-8
+                gram1 = p.grad.float() if p.size(0) <= p.size(1) else p.grad.float().T
+                gram2 = gram1 @ gram1.T
+                frobenius_norm2 = torch.linalg.norm(gram2, ord='fro').item()
+                spectral_norm_est_t2 = frobenius_norm2 ** (0.5)
+                gram4 = gram2 @ gram2.T
+                frobenius_norm4 = torch.linalg.norm(gram4, ord='fro').item()
+                spectral_norm_est_t4 = frobenius_norm4 ** (0.25)
+                print0(f"G {name = } | {median_sv = :.7f} | {spectral_norm = :.7f} | {frobenius_norm = :.7f} | {spectral_norm_est_t2 = :.7f} | {spectral_norm_est_t4 = :.7f}")
+        torch.save(log, "logs/%s/grad_state_step%06d.pt" % (run_id, step))
+        print0("saved grads to logs/%s/grad_state_step%06d.pt" % (run_id, step))
+        print0("===========================================")
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+    # momentum warmup for Muon
+    frac = min(step/300, 1)
+    for group in optimizer3.param_groups:
+        group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    # step the optimizers and schedulers
+    for opt, sched in zip(optimizers, schedulers):
+        opt.step()
+        sched.step()
+    # null the gradients
+    model.zero_grad(set_to_none=True)
+    # --------------- TRAINING SECTION END -------------------
+    # everything that follows now is just diagnostics, prints, logging, etc.
+    approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+    print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+
+print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+# -------------------------------------------------------------------------
+# clean up nice
+dist.destroy_process_group()
+====================================================================================================
+Running python 3.10.12 (main, Sep 11 2024, 15:47:36) [GCC 11.4.0]
+Running pytorch 2.6.0.dev20241203+cu124 compiled for CUDA 12.4
+nvidia-smi:
+Wed Dec 11 14:34:19 2024       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.03              Driver Version: 560.35.03      CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:0A:00.0 Off |                    0 |
+| N/A   23C    P0             69W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:0F:00.0 Off |                    0 |
+| N/A   23C    P0             82W /  700W |      23MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:10:00.0 Off |                    0 |
+| N/A   23C    P0             76W /  700W |      23MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:11:00.0 Off |                    0 |
+| N/A   24C    P0             85W /  700W |      23MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+Training DataLoader: total number of tokens: 900000000 across 9 files
+Validation DataLoader: total number of tokens: 100000000 across 1 files
+====================================================================================================
+step:0/1480 val_loss:10.8258 train_time:0ms step_avg:nanms
+============== Weight norms: ==============
+W name = 'module._orig_mod.embed.weight' | l1_to_l2_norm = 27.7048492
+W name = 'module._orig_mod.blocks.0.attn.c_q.weight' | median_sv = 0.4659798 | spectral_norm = 1.1528020 | frobenius_norm = 15.9970598
+W name = 'module._orig_mod.blocks.0.attn.c_k.weight' | median_sv = 0.4664021 | spectral_norm = 1.1406485 | frobenius_norm = 16.0039310
+W name = 'module._orig_mod.blocks.0.attn.c_v.weight' | median_sv = 0.4667232 | spectral_norm = 1.1570581 | frobenius_norm = 15.9997463
+W name = 'module._orig_mod.blocks.0.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.0.mlp.c_fc.weight' | median_sv = 1.1057316 | spectral_norm = 1.7294513 | frobenius_norm = 32.0131950
+W name = 'module._orig_mod.blocks.0.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.1.attn.c_q.weight' | median_sv = 0.4666883 | spectral_norm = 1.1479228 | frobenius_norm = 16.0175476
+W name = 'module._orig_mod.blocks.1.attn.c_k.weight' | median_sv = 0.4668983 | spectral_norm = 1.1481255 | frobenius_norm = 16.0075321
+W name = 'module._orig_mod.blocks.1.attn.c_v.weight' | median_sv = 0.4666663 | spectral_norm = 1.1438590 | frobenius_norm = 15.9813519
+W name = 'module._orig_mod.blocks.1.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.1.mlp.c_fc.weight' | median_sv = 1.1068062 | spectral_norm = 1.7318592 | frobenius_norm = 32.0057526
+W name = 'module._orig_mod.blocks.1.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.2.attn.c_q.weight' | median_sv = 0.4658037 | spectral_norm = 1.1431326 | frobenius_norm = 16.0001392
+W name = 'module._orig_mod.blocks.2.attn.c_k.weight' | median_sv = 0.4663929 | spectral_norm = 1.1498477 | frobenius_norm = 16.0125084
+W name = 'module._orig_mod.blocks.2.attn.c_v.weight' | median_sv = 0.4675128 | spectral_norm = 1.1391181 | frobenius_norm = 16.0082130
+W name = 'module._orig_mod.blocks.2.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.2.mlp.c_fc.weight' | median_sv = 1.1031516 | spectral_norm = 1.7199546 | frobenius_norm = 32.0009613
+W name = 'module._orig_mod.blocks.2.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.3.attn.c_q.weight' | median_sv = 0.4660843 | spectral_norm = 1.1469418 | frobenius_norm = 15.9908915
+W name = 'module._orig_mod.blocks.3.attn.c_k.weight' | median_sv = 0.4659975 | spectral_norm = 1.1521078 | frobenius_norm = 15.9877758
+W name = 'module._orig_mod.blocks.3.attn.c_v.weight' | median_sv = 0.4658088 | spectral_norm = 1.1390430 | frobenius_norm = 16.0032959
+W name = 'module._orig_mod.blocks.3.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.3.mlp.c_fc.weight' | median_sv = 1.1050390 | spectral_norm = 1.7379873 | frobenius_norm = 32.0061951
+W name = 'module._orig_mod.blocks.3.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.4.attn.c_q.weight' | median_sv = 0.4672275 | spectral_norm = 1.1499859 | frobenius_norm = 16.0149574
+W name = 'module._orig_mod.blocks.4.attn.c_k.weight' | median_sv = 0.4662328 | spectral_norm = 1.1350530 | frobenius_norm = 16.0086517
+W name = 'module._orig_mod.blocks.4.attn.c_v.weight' | median_sv = 0.4672491 | spectral_norm = 1.1396073 | frobenius_norm = 16.0075607
+W name = 'module._orig_mod.blocks.4.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.4.mlp.c_fc.weight' | median_sv = 1.1039091 | spectral_norm = 1.7266896 | frobenius_norm = 32.0003853
+W name = 'module._orig_mod.blocks.4.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.5.attn.c_q.weight' | median_sv = 0.4656476 | spectral_norm = 1.1498835 | frobenius_norm = 15.9830580
+W name = 'module._orig_mod.blocks.5.attn.c_k.weight' | median_sv = 0.4654225 | spectral_norm = 1.1451546 | frobenius_norm = 15.9934549
+W name = 'module._orig_mod.blocks.5.attn.c_v.weight' | median_sv = 0.4677319 | spectral_norm = 1.1447750 | frobenius_norm = 16.0198975
+W name = 'module._orig_mod.blocks.5.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.5.mlp.c_fc.weight' | median_sv = 1.1054295 | spectral_norm = 1.7236252 | frobenius_norm = 31.9996033
+W name = 'module._orig_mod.blocks.5.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.6.attn.c_q.weight' | median_sv = 0.4651812 | spectral_norm = 1.1545438 | frobenius_norm = 15.9938278
+W name = 'module._orig_mod.blocks.6.attn.c_k.weight' | median_sv = 0.4661483 | spectral_norm = 1.1470234 | frobenius_norm = 16.0046024
+W name = 'module._orig_mod.blocks.6.attn.c_v.weight' | median_sv = 0.4658745 | spectral_norm = 1.1438569 | frobenius_norm = 15.9990349
+W name = 'module._orig_mod.blocks.6.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.6.mlp.c_fc.weight' | median_sv = 1.1075070 | spectral_norm = 1.7333637 | frobenius_norm = 32.0188675
+W name = 'module._orig_mod.blocks.6.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.7.attn.c_q.weight' | median_sv = 0.4654107 | spectral_norm = 1.1511899 | frobenius_norm = 16.0064983
+W name = 'module._orig_mod.blocks.7.attn.c_k.weight' | median_sv = 0.4653058 | spectral_norm = 1.1433733 | frobenius_norm = 16.0121307
+W name = 'module._orig_mod.blocks.7.attn.c_v.weight' | median_sv = 0.4660176 | spectral_norm = 1.1544520 | frobenius_norm = 16.0152245
+W name = 'module._orig_mod.blocks.7.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.7.mlp.c_fc.weight' | median_sv = 1.1037908 | spectral_norm = 1.7325349 | frobenius_norm = 32.0035706
+W name = 'module._orig_mod.blocks.7.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.8.attn.c_q.weight' | median_sv = 0.4691461 | spectral_norm = 1.1569440 | frobenius_norm = 16.0047512
+W name = 'module._orig_mod.blocks.8.attn.c_k.weight' | median_sv = 0.4637561 | spectral_norm = 1.1568495 | frobenius_norm = 15.9817123
+W name = 'module._orig_mod.blocks.8.attn.c_v.weight' | median_sv = 0.4651510 | spectral_norm = 1.1573124 | frobenius_norm = 15.9909306
+W name = 'module._orig_mod.blocks.8.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.8.mlp.c_fc.weight' | median_sv = 1.1066146 | spectral_norm = 1.7269949 | frobenius_norm = 32.0007858
+W name = 'module._orig_mod.blocks.8.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.9.attn.c_q.weight' | median_sv = 0.4658159 | spectral_norm = 1.1389570 | frobenius_norm = 15.9875383
+W name = 'module._orig_mod.blocks.9.attn.c_k.weight' | median_sv = 0.4662949 | spectral_norm = 1.1438944 | frobenius_norm = 16.0080452
+W name = 'module._orig_mod.blocks.9.attn.c_v.weight' | median_sv = 0.4667253 | spectral_norm = 1.1505997 | frobenius_norm = 16.0094948
+W name = 'module._orig_mod.blocks.9.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.9.mlp.c_fc.weight' | median_sv = 1.1046192 | spectral_norm = 1.7259482 | frobenius_norm = 31.9892693
+W name = 'module._orig_mod.blocks.9.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.10.attn.c_q.weight' | median_sv = 0.4663324 | spectral_norm = 1.1528729 | frobenius_norm = 16.0043888
+W name = 'module._orig_mod.blocks.10.attn.c_k.weight' | median_sv = 0.4646106 | spectral_norm = 1.1370538 | frobenius_norm = 15.9852457
+W name = 'module._orig_mod.blocks.10.attn.c_v.weight' | median_sv = 0.4658431 | spectral_norm = 1.1491776 | frobenius_norm = 15.9893942
+W name = 'module._orig_mod.blocks.10.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.10.mlp.c_fc.weight' | median_sv = 1.1053419 | spectral_norm = 1.7305599 | frobenius_norm = 31.9979496
+W name = 'module._orig_mod.blocks.10.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.11.attn.c_q.weight' | median_sv = 0.4646469 | spectral_norm = 1.1618242 | frobenius_norm = 15.9998178
+W name = 'module._orig_mod.blocks.11.attn.c_k.weight' | median_sv = 0.4655768 | spectral_norm = 1.1498022 | frobenius_norm = 16.0131607
+W name = 'module._orig_mod.blocks.11.attn.c_v.weight' | median_sv = 0.4650176 | spectral_norm = 1.1454324 | frobenius_norm = 16.0012035
+W name = 'module._orig_mod.blocks.11.attn.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.blocks.11.mlp.c_fc.weight' | median_sv = 1.1060492 | spectral_norm = 1.7293037 | frobenius_norm = 32.0110283
+W name = 'module._orig_mod.blocks.11.mlp.c_proj.weight' | median_sv = 0.0000000 | spectral_norm = 0.0000000 | frobenius_norm = 0.0000000
+W name = 'module._orig_mod.value_embeds.weight' | l1_to_l2_norm = 67.8829117
+W name = 'module._orig_mod.lm_head.weight' | median_sv = 0.0000000 | spectral_norm = -0.0000000 | frobenius_norm = 0.0000000
+===========================================
+step:1/1480 train_time:28000ms step_avg:nanms
+step:2/1480 train_time:28269ms step_avg:nanms
+step:3/1480 train_time:28542ms step_avg:nanms
+step:4/1480 train_time:28816ms step_avg:nanms
+step:5/1480 train_time:29091ms step_avg:nanms
+step:6/1480 train_time:29368ms step_avg:nanms
+step:7/1480 train_time:29643ms step_avg:nanms
+step:8/1480 train_time:29917ms step_avg:nanms
+step:9/1480 train_time:30192ms step_avg:nanms
+step:10/1480 train_time:30468ms step_avg:nanms
+step:11/1480 train_time:276ms step_avg:nanms
+step:12/1480 train_time:551ms step_avg:nanms
+step:13/1480 train_time:826ms step_avg:275.48ms
+step:14/1480 train_time:1103ms step_avg:275.81ms
+step:15/1480 train_time:1380ms step_avg:276.03ms
+step:16/1480 train_time:1657ms step_avg:276.19ms
+step:17/1480 train_time:1932ms step_avg:276.02ms
+step:18/1480 train_time:2209ms step_avg:276.10ms
+step:19/1480 train_time:2484ms step_avg:275.95ms
+step:20/1480 train_time:2759ms step_avg:275.93ms
+step:21/1480 train_time:3034ms step_avg:275.81ms
+step:22/1480 train_time:3309ms step_avg:275.75ms
+step:23/1480 train_time:3585ms step_avg:275.77ms
+step:24/1480 train_time:3863ms step_avg:275.91ms
+step:25/1480 train_time:4141ms step_avg:276.07ms
+step:26/1480 train_time:4417ms step_avg:276.03ms
+step:27/1480 train_time:4694ms step_avg:276.10ms
+step:28/1480 train_time:4968ms step_avg:276.01ms
+step:29/1480 train_time:5243ms step_avg:275.94ms
+step:30/1480 train_time:5519ms step_avg:275.97ms
+step:31/1480 train_time:5795ms step_avg:275.98ms
+step:32/1480 train_time:6070ms step_avg:275.92ms
+step:33/1480 train_time:6346ms step_avg:275.93ms
+step:34/1480 train_time:6622ms step_avg:275.92ms
+step:35/1480 train_time:6898ms step_avg:275.92ms
+step:36/1480 train_time:7172ms step_avg:275.85ms
+step:37/1480 train_time:7449ms step_avg:275.88ms
+step:38/1480 train_time:7723ms step_avg:275.82ms
+step:39/1480 train_time:8001ms step_avg:275.88ms
+step:40/1480 train_time:8278ms step_avg:275.94ms
+step:41/1480 train_time:8553ms step_avg:275.91ms
+step:42/1480 train_time:8832ms step_avg:275.99ms
+step:43/1480 train_time:9105ms step_avg:275.90ms
+step:44/1480 train_time:9383ms step_avg:275.96ms
+step:45/1480 train_time:9659ms step_avg:275.98ms
+step:46/1480 train_time:9933ms step_avg:275.93ms
+step:47/1480 train_time:10207ms step_avg:275.86ms
+step:48/1480 train_time:10483ms step_avg:275.86ms
+step:49/1480 train_time:10758ms step_avg:275.85ms
+step:50/1480 train_time:11033ms step_avg:275.83ms
+step:51/1480 train_time:11309ms step_avg:275.83ms
+step:52/1480 train_time:11583ms step_avg:275.79ms
+step:53/1480 train_time:11862ms step_avg:275.85ms
+step:54/1480 train_time:12136ms step_avg:275.83ms
+step:55/1480 train_time:12415ms step_avg:275.89ms
+step:56/1480 train_time:12691ms step_avg:275.88ms
+step:57/1480 train_time:12966ms step_avg:275.87ms
+step:58/1480 train_time:13242ms step_avg:275.88ms
+step:59/1480 train_time:13521ms step_avg:275.93ms
+step:60/1480 train_time:13797ms step_avg:275.94ms
+step:61/1480 train_time:14073ms step_avg:275.94ms
+step:62/1480 train_time:14350ms step_avg:275.96ms
+step:63/1480 train_time:14625ms step_avg:275.94ms
+step:64/1480 train_time:14901ms step_avg:275.94ms
+step:65/1480 train_time:15177ms step_avg:275.94ms
+step:66/1480 train_time:15454ms step_avg:275.97ms
+step:67/1480 train_time:15729ms step_avg:275.95ms
+step:68/1480 train_time:16004ms step_avg:275.94ms
+step:69/1480 train_time:16281ms step_avg:275.94ms
+step:70/1480 train_time:16558ms step_avg:275.97ms
+step:71/1480 train_time:16833ms step_avg:275.96ms
+step:72/1480 train_time:17108ms step_avg:275.94ms
+step:73/1480 train_time:17383ms step_avg:275.92ms
+step:74/1480 train_time:17659ms step_avg:275.92ms
+step:75/1480 train_time:17935ms step_avg:275.92ms
+step:76/1480 train_time:18210ms step_avg:275.91ms
+step:77/1480 train_time:18486ms step_avg:275.92ms
+step:78/1480 train_time:18762ms step_avg:275.91ms
+step:79/1480 train_time:19039ms step_avg:275.93ms
+step:80/1480 train_time:19318ms step_avg:275.97ms
+step:81/1480 train_time:19594ms step_avg:275.97ms
+step:82/1480 train_time:19868ms step_avg:275.95ms
+step:83/1480 train_time:20144ms step_avg:275.95ms
+step:84/1480 train_time:20422ms step_avg:275.97ms
+step:85/1480 train_time:20698ms step_avg:275.97ms
+step:86/1480 train_time:20973ms step_avg:275.96ms
+step:87/1480 train_time:21249ms step_avg:275.96ms
+step:88/1480 train_time:21526ms step_avg:275.97ms
+step:89/1480 train_time:21803ms step_avg:275.99ms
+step:90/1480 train_time:22080ms step_avg:276.00ms
+step:91/1480 train_time:22356ms step_avg:276.00ms
+step:92/1480 train_time:22632ms step_avg:276.00ms
+step:93/1480 train_time:22907ms step_avg:275.98ms
+step:94/1480 train_time:23183ms step_avg:275.98ms
+step:95/1480 train_time:23460ms step_avg:276.00ms
+step:96/1480 train_time:23737ms step_avg:276.01ms
+step:97/1480 train_time:24013ms step_avg:276.02ms
+step:98/1480 train_time:24287ms step_avg:275.99ms
+step:99/1480 train_time:24562ms step_avg:275.98ms
+step:100/1480 train_time:24839ms step_avg:275.99ms
+step:101/1480 train_time:25116ms step_avg:276.00ms
+step:102/1480 train_time:25391ms step_avg:275.99ms
+step:103/1480 train_time:25665ms step_avg:275.97ms
+step:104/1480 train_time:25941ms step_avg:275.97ms
+step:105/1480 train_time:26219ms step_avg:275.98ms
+step:106/1480 train_time:26495ms step_avg:275.99ms
+step:107/1480 train_time:26769ms step_avg:275.97ms
+step:108/1480 train_time:27046ms step_avg:275.98ms
+step:109/1480 train_time:27322ms step_avg:275.98ms
+step:110/1480 train_time:27599ms step_avg:275.99ms
+step:111/1480 train_time:27884ms step_avg:276.08ms
+step:112/1480 train_time:28168ms step_avg:276.16ms
+step:113/1480 train_time:28454ms step_avg:276.25ms
+step:114/1480 train_time:28739ms step_avg:276.33ms
+step:115/1480 train_time:29023ms step_avg:276.41ms
+step:116/1480 train_time:29307ms step_avg:276.48ms
+step:117/1480 train_time:29591ms step_avg:276.55ms
+step:118/1480 train_time:29875ms step_avg:276.62ms
+step:119/1480 train_time:30159ms step_avg:276.69ms
+step:120/1480 train_time:30447ms step_avg:276.79ms
+step:121/1480 train_time:30731ms step_avg:276.86ms
+step:122/1480 train_time:31017ms step_avg:276.94ms
+step:123/1480 train_time:31301ms step_avg:277.00ms
+step:124/1480 train_time:31586ms step_avg:277.07ms
+step:125/1480 train_time:31870ms step_avg:277.13ms
+step:125/1480 val_loss:4.4083 train_time:31884ms step_avg:277.25ms
+============== Weight norms: ==============
+W name = 'module._orig_mod.embed.weight' | l1_to_l2_norm = 110.3288040
+W name = 'module._orig_mod.blocks.0.attn.c_q.weight' | median_sv = 1.0647993 | spectral_norm = 3.6505501 | frobenius_norm = 36.6034126
+W name = 'module._orig_mod.blocks.0.attn.c_k.weight' | median_sv = 0.9685424 | spectral_norm = 4.5011511 | frobenius_norm = 34.2348976
+W name = 'module._orig_mod.blocks.0.attn.c_v.weight' | median_sv = 0.9822439 | spectral_norm = 3.0771492 | frobenius_norm = 35.7306061
+W name = 'module._orig_mod.blocks.0.attn.c_proj.weight' | median_sv = 1.0871075 | spectral_norm = 2.5842481 | frobenius_norm = 36.0957069
+W name = 'module._orig_mod.blocks.0.mlp.c_fc.weight' | median_sv = 2.3737376 | spectral_norm = 5.6517553 | frobenius_norm = 70.4213791
+W name = 'module._orig_mod.blocks.0.mlp.c_proj.weight' | median_sv = 1.3032308 | spectral_norm = 2.8542533 | frobenius_norm = 38.8441162
+W name = 'module._orig_mod.blocks.1.attn.c_q.weight' | median_sv = 0.9995599 | spectral_norm = 3.2951851 | frobenius_norm = 34.8742981
+W name = 'module._orig_mod.blocks.1.attn.c_k.weight' | median_sv = 0.9709250 | spectral_norm = 3.5932195 | frobenius_norm = 34.0238953
+W name = 'module._orig_mod.blocks.1.attn.c_v.weight' | median_sv = 0.9463788 | spectral_norm = 3.4887686 | frobenius_norm = 36.5140114
+W name = 'module._orig_mod.blocks.1.attn.c_proj.weight' | median_sv = 1.1430252 | spectral_norm = 2.6142581 | frobenius_norm = 37.7830620
+W name = 'module._orig_mod.blocks.1.mlp.c_fc.weight' | median_sv = 2.6359632 | spectral_norm = 5.5451012 | frobenius_norm = 77.7149811
+W name = 'module._orig_mod.blocks.1.mlp.c_proj.weight' | median_sv = 1.4164337 | spectral_norm = 2.9766703 | frobenius_norm = 41.9375038
+W name = 'module._orig_mod.blocks.2.attn.c_q.weight' | median_sv = 0.9619044 | spectral_norm = 2.9432480 | frobenius_norm = 34.4444733
+W name = 'module._orig_mod.blocks.2.attn.c_k.weight' | median_sv = 0.9678621 | spectral_norm = 3.0339565 | frobenius_norm = 34.5862083
+W name = 'module._orig_mod.blocks.2.attn.c_v.weight' | median_sv = 0.9603114 | spectral_norm = 3.6415832 | frobenius_norm = 37.5335999
+W name = 'module._orig_mod.blocks.2.attn.c_proj.weight' | median_sv = 1.1755869 | spectral_norm = 2.7431419 | frobenius_norm = 39.2628479
+W name = 'module._orig_mod.blocks.2.mlp.c_fc.weight' | median_sv = 2.7129378 | spectral_norm = 5.4680862 | frobenius_norm = 80.0682373
+W name = 'module._orig_mod.blocks.2.mlp.c_proj.weight' | median_sv = 1.4351240 | spectral_norm = 3.0857155 | frobenius_norm = 42.5319519
+W name = 'module._orig_mod.blocks.3.attn.c_q.weight' | median_sv = 0.9648145 | spectral_norm = 3.2153676 | frobenius_norm = 34.0900497
+W name = 'module._orig_mod.blocks.3.attn.c_k.weight' | median_sv = 0.9646394 | spectral_norm = 3.1013958 | frobenius_norm = 34.0721550
+W name = 'module._orig_mod.blocks.3.attn.c_v.weight' | median_sv = 0.9341458 | spectral_norm = 3.6731577 | frobenius_norm = 37.3063698
+W name = 'module._orig_mod.blocks.3.attn.c_proj.weight' | median_sv = 1.1242064 | spectral_norm = 2.7234378 | frobenius_norm = 37.9352188
+W name = 'module._orig_mod.blocks.3.mlp.c_fc.weight' | median_sv = 2.7132306 | spectral_norm = 5.3835206 | frobenius_norm = 80.1923523
+W name = 'module._orig_mod.blocks.3.mlp.c_proj.weight' | median_sv = 1.4297239 | spectral_norm = 3.0665970 | frobenius_norm = 42.5565453
+W name = 'module._orig_mod.blocks.4.attn.c_q.weight' | median_sv = 0.9311400 | spectral_norm = 2.9090080 | frobenius_norm = 33.3963356
+W name = 'module._orig_mod.blocks.4.attn.c_k.weight' | median_sv = 0.9537056 | spectral_norm = 2.9659498 | frobenius_norm = 34.3970413
+W name = 'module._orig_mod.blocks.4.attn.c_v.weight' | median_sv = 0.8874425 | spectral_norm = 3.6009367 | frobenius_norm = 36.8151894
+W name = 'module._orig_mod.blocks.4.attn.c_proj.weight' | median_sv = 1.0984624 | spectral_norm = 2.8318851 | frobenius_norm = 38.0405846
+W name = 'module._orig_mod.blocks.4.mlp.c_fc.weight' | median_sv = 2.7392042 | spectral_norm = 5.4176784 | frobenius_norm = 81.2226791
+W name = 'module._orig_mod.blocks.4.mlp.c_proj.weight' | median_sv = 1.4302678 | spectral_norm = 3.0611367 | frobenius_norm = 42.6724243
+W name = 'module._orig_mod.blocks.5.attn.c_q.weight' | median_sv = 0.9401265 | spectral_norm = 3.0195715 | frobenius_norm = 33.4950829
+W name = 'module._orig_mod.blocks.5.attn.c_k.weight' | median_sv = 0.9516341 | spectral_norm = 2.8962924 | frobenius_norm = 34.0166588
+W name = 'module._orig_mod.blocks.5.attn.c_v.weight' | median_sv = 0.9016523 | spectral_norm = 3.6930807 | frobenius_norm = 36.8507233
+W name = 'module._orig_mod.blocks.5.attn.c_proj.weight' | median_sv = 1.1090053 | spectral_norm = 2.8208990 | frobenius_norm = 37.9430389
+W name = 'module._orig_mod.blocks.5.mlp.c_fc.weight' | median_sv = 2.7421510 | spectral_norm = 5.5827537 | frobenius_norm = 81.5918045
+W name = 'module._orig_mod.blocks.5.mlp.c_proj.weight' | median_sv = 1.4075350 | spectral_norm = 2.9727225 | frobenius_norm = 42.2332077
+W name = 'module._orig_mod.blocks.6.attn.c_q.weight' | median_sv = 0.9289141 | spectral_norm = 2.9330790 | frobenius_norm = 33.1869507
+W name = 'module._orig_mod.blocks.6.attn.c_k.weight' | median_sv = 0.9331287 | spectral_norm = 2.9307294 | frobenius_norm = 33.7173729
+W name = 'module._orig_mod.blocks.6.attn.c_v.weight' | median_sv = 0.8592538 | spectral_norm = 3.4743919 | frobenius_norm = 35.8110580
+W name = 'module._orig_mod.blocks.6.attn.c_proj.weight' | median_sv = 1.0530939 | spectral_norm = 2.9507735 | frobenius_norm = 36.9635506
+W name = 'module._orig_mod.blocks.6.mlp.c_fc.weight' | median_sv = 2.7501543 | spectral_norm = 5.7080760 | frobenius_norm = 82.3601761
+W name = 'module._orig_mod.blocks.6.mlp.c_proj.weight' | median_sv = 1.3797907 | spectral_norm = 2.9330397 | frobenius_norm = 41.8727760
+W name = 'module._orig_mod.blocks.7.attn.c_q.weight' | median_sv = 0.9434513 | spectral_norm = 3.0390093 | frobenius_norm = 33.6919594
+W name = 'module._orig_mod.blocks.7.attn.c_k.weight' | median_sv = 0.9590561 | spectral_norm = 2.8777373 | frobenius_norm = 34.4258652
+W name = 'module._orig_mod.blocks.7.attn.c_v.weight' | median_sv = 0.8329132 | spectral_norm = 3.5396900 | frobenius_norm = 35.2472382
+W name = 'module._orig_mod.blocks.7.attn.c_proj.weight' | median_sv = 1.0848055 | spectral_norm = 2.9914496 | frobenius_norm = 37.6351547
+W name = 'module._orig_mod.blocks.7.mlp.c_fc.weight' | median_sv = 2.7515609 | spectral_norm = 5.8062472 | frobenius_norm = 82.3830185
+W name = 'module._orig_mod.blocks.7.mlp.c_proj.weight' | median_sv = 1.3730046 | spectral_norm = 2.9147353 | frobenius_norm = 41.6332436
+W name = 'module._orig_mod.blocks.8.attn.c_q.weight' | median_sv = 0.9271175 | spectral_norm = 3.0445971 | frobenius_norm = 33.4379959
+W name = 'module._orig_mod.blocks.8.attn.c_k.weight' | median_sv = 0.9395904 | spectral_norm = 2.9753134 | frobenius_norm = 33.9661827
+W name = 'module._orig_mod.blocks.8.attn.c_v.weight' | median_sv = 0.8406555 | spectral_norm = 3.3524947 | frobenius_norm = 34.8709641
+W name = 'module._orig_mod.blocks.8.attn.c_proj.weight' | median_sv = 1.0963477 | spectral_norm = 2.7585850 | frobenius_norm = 37.6455193
+W name = 'module._orig_mod.blocks.8.mlp.c_fc.weight' | median_sv = 2.7340667 | spectral_norm = 5.9571271 | frobenius_norm = 81.9154816
+W name = 'module._orig_mod.blocks.8.mlp.c_proj.weight' | median_sv = 1.3494461 | spectral_norm = 2.9230201 | frobenius_norm = 41.0820618
+W name = 'module._orig_mod.blocks.9.attn.c_q.weight' | median_sv = 0.9345611 | spectral_norm = 3.0184412 | frobenius_norm = 33.5817375
+W name = 'module._orig_mod.blocks.9.attn.c_k.weight' | median_sv = 0.9608170 | spectral_norm = 3.0449147 | frobenius_norm = 34.4003716
+W name = 'module._orig_mod.blocks.9.attn.c_v.weight' | median_sv = 0.8622487 | spectral_norm = 3.3614860 | frobenius_norm = 35.2967110
+W name = 'module._orig_mod.blocks.9.attn.c_proj.weight' | median_sv = 1.1385653 | spectral_norm = 2.7843215 | frobenius_norm = 38.7224045
+W name = 'module._orig_mod.blocks.9.mlp.c_fc.weight' | median_sv = 2.7075088 | spectral_norm = 5.9648137 | frobenius_norm = 81.1247253
+W name = 'module._orig_mod.blocks.9.mlp.c_proj.weight' | median_sv = 1.3288090 | spectral_norm = 2.9204221 | frobenius_norm = 40.5746994
+W name = 'module._orig_mod.blocks.10.attn.c_q.weight' | median_sv = 0.8926183 | spectral_norm = 2.9740839 | frobenius_norm = 32.9644547
+W name = 'module._orig_mod.blocks.10.attn.c_k.weight' | median_sv = 0.8972519 | spectral_norm = 3.0509481 | frobenius_norm = 33.3170052
+W name = 'module._orig_mod.blocks.10.attn.c_v.weight' | median_sv = 0.8448082 | spectral_norm = 3.2885742 | frobenius_norm = 34.5938416
+W name = 'module._orig_mod.blocks.10.attn.c_proj.weight' | median_sv = 1.1823646 | spectral_norm = 2.8495603 | frobenius_norm = 40.5706635
+W name = 'module._orig_mod.blocks.10.mlp.c_fc.weight' | median_sv = 2.6955628 | spectral_norm = 5.9963746 | frobenius_norm = 80.5750656
+W name = 'module._orig_mod.blocks.10.mlp.c_proj.weight' | median_sv = 1.3051407 | spectral_norm = 2.9128582 | frobenius_norm = 39.7798805
+W name = 'module._orig_mod.blocks.11.attn.c_q.weight' | median_sv = 0.9122385 | spectral_norm = 3.0996246 | frobenius_norm = 32.9625168
+W name = 'module._orig_mod.blocks.11.attn.c_k.weight' | median_sv = 0.9158748 | spectral_norm = 3.2572601 | frobenius_norm = 33.5537529
+W name = 'module._orig_mod.blocks.11.attn.c_v.weight' | median_sv = 0.8314505 | spectral_norm = 3.0678358 | frobenius_norm = 33.8165665
+W name = 'module._orig_mod.blocks.11.attn.c_proj.weight' | median_sv = 1.1372163 | spectral_norm = 2.7602897 | frobenius_norm = 39.0466118
+W name = 'module._orig_mod.blocks.11.mlp.c_fc.weight' | median_sv = 2.6427121 | spectral_norm = 6.0381331 | frobenius_norm = 79.2588806
+W name = 'module._orig_mod.blocks.11.mlp.c_proj.weight' | median_sv = 1.2561846 | spectral_norm = 2.9056215 | frobenius_norm = 38.6568718
+W name = 'module._orig_mod.value_embeds.weight' | l1_to_l2_norm = 144.6612244
+W name = 'module._orig_mod.lm_head.weight' | median_sv = 10.4866600 | spectral_norm = 131.8448181 | frobenius_norm = 386.4027100
+===========================================
+============== Gradient norms: ==============
+G name = 'module._orig_mod.embed.weight' | l1_to_l2_norm = 0.0000004
+G name = 'module._orig_mod.blocks.0.attn.c_q.weight' | median_sv = 0.0000329 | spectral_norm = 0.0049282 | frobenius_norm = 0.0064047 | spectral_norm_est_t2 = 0.0049704 | spectral_norm_est_t4 = 0.0049283
+G name = 'module._orig_mod.blocks.0.attn.c_k.weight' | median_sv = 0.0000355 | spectral_norm = 0.0045493 | frobenius_norm = 0.0068542 | spectral_norm_est_t2 = 0.0047033 | spectral_norm_est_t4 = 0.0045527
+G name = 'module._orig_mod.blocks.0.attn.c_v.weight' | median_sv = 0.0000278 | spectral_norm = 0.0266530 | frobenius_norm = 0.0276607 | spectral_norm_est_t2 = 0.0266640 | spectral_norm_est_t4 = 0.0266513
+G name = 'module._orig_mod.blocks.0.attn.c_proj.weight' | median_sv = 0.0000782 | spectral_norm = 0.0395106 | frobenius_norm = 0.0415830 | spectral_norm_est_t2 = 0.0395237 | spectral_norm_est_t4 = 0.0395118
+G name = 'module._orig_mod.blocks.0.mlp.c_fc.weight' | median_sv = 0.0001176 | spectral_norm = 0.0119420 | frobenius_norm = 0.0143394 | spectral_norm_est_t2 = 0.0119648 | spectral_norm_est_t4 = 0.0119421
+G name = 'module._orig_mod.blocks.0.mlp.c_proj.weight' | median_sv = 0.0001825 | spectral_norm = 0.0231980 | frobenius_norm = 0.0263960 | spectral_norm_est_t2 = 0.0232185 | spectral_norm_est_t4 = 0.0231998
+G name = 'module._orig_mod.blocks.1.attn.c_q.weight' | median_sv = 0.0000289 | spectral_norm = 0.0070290 | frobenius_norm = 0.0081911 | spectral_norm_est_t2 = 0.0070429 | spectral_norm_est_t4 = 0.0070287
+G name = 'module._orig_mod.blocks.1.attn.c_k.weight' | median_sv = 0.0000322 | spectral_norm = 0.0038995 | frobenius_norm = 0.0072070 | spectral_norm_est_t2 = 0.0044939 | spectral_norm_est_t4 = 0.0040168
+G name = 'module._orig_mod.blocks.1.attn.c_v.weight' | median_sv = 0.0000350 | spectral_norm = 0.0413652 | frobenius_norm = 0.0424112 | spectral_norm_est_t2 = 0.0413711 | spectral_norm_est_t4 = 0.0413649
+G name = 'module._orig_mod.blocks.1.attn.c_proj.weight' | median_sv = 0.0000751 | spectral_norm = 0.0203368 | frobenius_norm = 0.0242586 | spectral_norm_est_t2 = 0.0203997 | spectral_norm_est_t4 = 0.0203364
+G name = 'module._orig_mod.blocks.1.mlp.c_fc.weight' | median_sv = 0.0000883 | spectral_norm = 0.0121682 | frobenius_norm = 0.0146927 | spectral_norm_est_t2 = 0.0121934 | spectral_norm_est_t4 = 0.0121700
+G name = 'module._orig_mod.blocks.1.mlp.c_proj.weight' | median_sv = 0.0001475 | spectral_norm = 0.0205950 | frobenius_norm = 0.0236840 | spectral_norm_est_t2 = 0.0206155 | spectral_norm_est_t4 = 0.0205963
+G name = 'module._orig_mod.blocks.2.attn.c_q.weight' | median_sv = 0.0000351 | spectral_norm = 0.0089638 | frobenius_norm = 0.0104070 | spectral_norm_est_t2 = 0.0089783 | spectral_norm_est_t4 = 0.0089634
+G name = 'module._orig_mod.blocks.2.attn.c_k.weight' | median_sv = 0.0000379 | spectral_norm = 0.0048223 | frobenius_norm = 0.0087516 | spectral_norm_est_t2 = 0.0054917 | spectral_norm_est_t4 = 0.0049444
+G name = 'module._orig_mod.blocks.2.attn.c_v.weight' | median_sv = 0.0000211 | spectral_norm = 0.0297308 | frobenius_norm = 0.0302099 | spectral_norm_est_t2 = 0.0297314 | spectral_norm_est_t4 = 0.0297306
+G name = 'module._orig_mod.blocks.2.attn.c_proj.weight' | median_sv = 0.0000657 | spectral_norm = 0.0157796 | frobenius_norm = 0.0189574 | spectral_norm_est_t2 = 0.0158631 | spectral_norm_est_t4 = 0.0157797
+G name = 'module._orig_mod.blocks.2.mlp.c_fc.weight' | median_sv = 0.0000777 | spectral_norm = 0.0118861 | frobenius_norm = 0.0141093 | spectral_norm_est_t2 = 0.0119116 | spectral_norm_est_t4 = 0.0118880
+G name = 'module._orig_mod.blocks.2.mlp.c_proj.weight' | median_sv = 0.0001282 | spectral_norm = 0.0182409 | frobenius_norm = 0.0212360 | spectral_norm_est_t2 = 0.0182670 | spectral_norm_est_t4 = 0.0182440
+G name = 'module._orig_mod.blocks.3.attn.c_q.weight' | median_sv = 0.0000259 | spectral_norm = 0.0055111 | frobenius_norm = 0.0066520 | spectral_norm_est_t2 = 0.0055272 | spectral_norm_est_t4 = 0.0055109
+G name = 'module._orig_mod.blocks.3.attn.c_k.weight' | median_sv = 0.0000280 | spectral_norm = 0.0029755 | frobenius_norm = 0.0063874 | spectral_norm_est_t2 = 0.0037560 | spectral_norm_est_t4 = 0.0032064
+G name = 'module._orig_mod.blocks.3.attn.c_v.weight' | median_sv = 0.0000198 | spectral_norm = 0.0251169 | frobenius_norm = 0.0258522 | spectral_norm_est_t2 = 0.0251203 | spectral_norm_est_t4 = 0.0251167
+G name = 'module._orig_mod.blocks.3.attn.c_proj.weight' | median_sv = 0.0000498 | spectral_norm = 0.0114911 | frobenius_norm = 0.0147243 | spectral_norm_est_t2 = 0.0115781 | spectral_norm_est_t4 = 0.0114912
+G name = 'module._orig_mod.blocks.3.mlp.c_fc.weight' | median_sv = 0.0000672 | spectral_norm = 0.0114449 | frobenius_norm = 0.0137885 | spectral_norm_est_t2 = 0.0114794 | spectral_norm_est_t4 = 0.0114462
+G name = 'module._orig_mod.blocks.3.mlp.c_proj.weight' | median_sv = 0.0001126 | spectral_norm = 0.0170433 | frobenius_norm = 0.0199342 | spectral_norm_est_t2 = 0.0170716 | spectral_norm_est_t4 = 0.0170460
+G name = 'module._orig_mod.blocks.4.attn.c_q.weight' | median_sv = 0.0000294 | spectral_norm = 0.0096288 | frobenius_norm = 0.0106823 | spectral_norm_est_t2 = 0.0096410 | spectral_norm_est_t4 = 0.0096285
+G name = 'module._orig_mod.blocks.4.attn.c_k.weight' | median_sv = 0.0000313 | spectral_norm = 0.0050102 | frobenius_norm = 0.0080177 | spectral_norm_est_t2 = 0.0053780 | spectral_norm_est_t4 = 0.0050462
+G name = 'module._orig_mod.blocks.4.attn.c_v.weight' | median_sv = 0.0000127 | spectral_norm = 0.0181491 | frobenius_norm = 0.0185771 | spectral_norm_est_t2 = 0.0181501 | spectral_norm_est_t4 = 0.0181490
+G name = 'module._orig_mod.blocks.4.attn.c_proj.weight' | median_sv = 0.0000395 | spectral_norm = 0.0098308 | frobenius_norm = 0.0122341 | spectral_norm_est_t2 = 0.0098868 | spectral_norm_est_t4 = 0.0098313
+G name = 'module._orig_mod.blocks.4.mlp.c_fc.weight' | median_sv = 0.0000564 | spectral_norm = 0.0098871 | frobenius_norm = 0.0119106 | spectral_norm_est_t2 = 0.0099115 | spectral_norm_est_t4 = 0.0098872
+G name = 'module._orig_mod.blocks.4.mlp.c_proj.weight' | median_sv = 0.0000967 | spectral_norm = 0.0145505 | frobenius_norm = 0.0171914 | spectral_norm_est_t2 = 0.0145746 | spectral_norm_est_t4 = 0.0145514
+G name = 'module._orig_mod.blocks.5.attn.c_q.weight' | median_sv = 0.0000222 | spectral_norm = 0.0059581 | frobenius_norm = 0.0070040 | spectral_norm_est_t2 = 0.0059721 | spectral_norm_est_t4 = 0.0059580
+G name = 'module._orig_mod.blocks.5.attn.c_k.weight' | median_sv = 0.0000241 | spectral_norm = 0.0038269 | frobenius_norm = 0.0067741 | spectral_norm_est_t2 = 0.0042770 | spectral_norm_est_t4 = 0.0038696
+G name = 'module._orig_mod.blocks.5.attn.c_v.weight' | median_sv = 0.0000107 | spectral_norm = 0.0136145 | frobenius_norm = 0.0140800 | spectral_norm_est_t2 = 0.0136173 | spectral_norm_est_t4 = 0.0136147
+G name = 'module._orig_mod.blocks.5.attn.c_proj.weight' | median_sv = 0.0000324 | spectral_norm = 0.0075322 | frobenius_norm = 0.0098268 | spectral_norm_est_t2 = 0.0076149 | spectral_norm_est_t4 = 0.0075327
+G name = 'module._orig_mod.blocks.5.mlp.c_fc.weight' | median_sv = 0.0000462 | spectral_norm = 0.0084458 | frobenius_norm = 0.0103145 | spectral_norm_est_t2 = 0.0084718 | spectral_norm_est_t4 = 0.0084460
+G name = 'module._orig_mod.blocks.5.mlp.c_proj.weight' | median_sv = 0.0000816 | spectral_norm = 0.0126710 | frobenius_norm = 0.0148569 | spectral_norm_est_t2 = 0.0126905 | spectral_norm_est_t4 = 0.0126730
+G name = 'module._orig_mod.blocks.6.attn.c_q.weight' | median_sv = 0.0000172 | spectral_norm = 0.0045873 | frobenius_norm = 0.0054045 | spectral_norm_est_t2 = 0.0046010 | spectral_norm_est_t4 = 0.0045873
+G name = 'module._orig_mod.blocks.6.attn.c_k.weight' | median_sv = 0.0000179 | spectral_norm = 0.0032282 | frobenius_norm = 0.0053659 | spectral_norm_est_t2 = 0.0036096 | spectral_norm_est_t4 = 0.0032928
+G name = 'module._orig_mod.blocks.6.attn.c_v.weight' | median_sv = 0.0000049 | spectral_norm = 0.0073606 | frobenius_norm = 0.0076031 | spectral_norm_est_t2 = 0.0073621 | spectral_norm_est_t4 = 0.0073606
+G name = 'module._orig_mod.blocks.6.attn.c_proj.weight' | median_sv = 0.0000221 | spectral_norm = 0.0055273 | frobenius_norm = 0.0066699 | spectral_norm_est_t2 = 0.0055518 | spectral_norm_est_t4 = 0.0055275
+G name = 'module._orig_mod.blocks.6.mlp.c_fc.weight' | median_sv = 0.0000321 | spectral_norm = 0.0060428 | frobenius_norm = 0.0072939 | spectral_norm_est_t2 = 0.0060606 | spectral_norm_est_t4 = 0.0060436
+G name = 'module._orig_mod.blocks.6.mlp.c_proj.weight' | median_sv = 0.0000578 | spectral_norm = 0.0105980 | frobenius_norm = 0.0122579 | spectral_norm_est_t2 = 0.0106152 | spectral_norm_est_t4 = 0.0106007
+G name = 'module._orig_mod.blocks.7.attn.c_q.weight' | median_sv = 0.0000144 | spectral_norm = 0.0028458 | frobenius_norm = 0.0036719 | spectral_norm_est_t2 = 0.0028664 | spectral_norm_est_t4 = 0.0028458
+G name = 'module._orig_mod.blocks.7.attn.c_k.weight' | median_sv = 0.0000153 | spectral_norm = 0.0020489 | frobenius_norm = 0.0036203 | spectral_norm_est_t2 = 0.0022314 | spectral_norm_est_t4 = 0.0020599
+G name = 'module._orig_mod.blocks.7.attn.c_v.weight' | median_sv = 0.0000055 | spectral_norm = 0.0090304 | frobenius_norm = 0.0092758 | spectral_norm_est_t2 = 0.0090317 | spectral_norm_est_t4 = 0.0090305
+G name = 'module._orig_mod.blocks.7.attn.c_proj.weight' | median_sv = 0.0000228 | spectral_norm = 0.0061379 | frobenius_norm = 0.0070011 | spectral_norm_est_t2 = 0.0061485 | spectral_norm_est_t4 = 0.0061380
+G name = 'module._orig_mod.blocks.7.mlp.c_fc.weight' | median_sv = 0.0000324 | spectral_norm = 0.0063117 | frobenius_norm = 0.0075143 | spectral_norm_est_t2 = 0.0063283 | spectral_norm_est_t4 = 0.0063117
+G name = 'module._orig_mod.blocks.7.mlp.c_proj.weight' | median_sv = 0.0000598 | spectral_norm = 0.0116126 | frobenius_norm = 0.0131992 | spectral_norm_est_t2 = 0.0116277 | spectral_norm_est_t4 = 0.0116149
+G name = 'module._orig_mod.blocks.8.attn.c_q.weight' | median_sv = 0.0000196 | spectral_norm = 0.0049505 | frobenius_norm = 0.0061080 | spectral_norm_est_t2 = 0.0050031 | spectral_norm_est_t4 = 0.0049512
+G name = 'module._orig_mod.blocks.8.attn.c_k.weight' | median_sv = 0.0000207 | spectral_norm = 0.0032166 | frobenius_norm = 0.0055578 | spectral_norm_est_t2 = 0.0035647 | spectral_norm_est_t4 = 0.0032588
+G name = 'module._orig_mod.blocks.8.attn.c_v.weight' | median_sv = 0.0000052 | spectral_norm = 0.0076467 | frobenius_norm = 0.0079009 | spectral_norm_est_t2 = 0.0076481 | spectral_norm_est_t4 = 0.0076467
+G name = 'module._orig_mod.blocks.8.attn.c_proj.weight' | median_sv = 0.0000310 | spectral_norm = 0.0091007 | frobenius_norm = 0.0104794 | spectral_norm_est_t2 = 0.0091344 | spectral_norm_est_t4 = 0.0091008
+G name = 'module._orig_mod.blocks.8.mlp.c_fc.weight' | median_sv = 0.0000355 | spectral_norm = 0.0072294 | frobenius_norm = 0.0084519 | spectral_norm_est_t2 = 0.0072451 | spectral_norm_est_t4 = 0.0072295
+G name = 'module._orig_mod.blocks.8.mlp.c_proj.weight' | median_sv = 0.0000650 | spectral_norm = 0.0142720 | frobenius_norm = 0.0159555 | spectral_norm_est_t2 = 0.0142877 | spectral_norm_est_t4 = 0.0142742
+G name = 'module._orig_mod.blocks.9.attn.c_q.weight' | median_sv = 0.0000197 | spectral_norm = 0.0048528 | frobenius_norm = 0.0057839 | spectral_norm_est_t2 = 0.0048729 | spectral_norm_est_t4 = 0.0048528
+G name = 'module._orig_mod.blocks.9.attn.c_k.weight' | median_sv = 0.0000208 | spectral_norm = 0.0031671 | frobenius_norm = 0.0050915 | spectral_norm_est_t2 = 0.0033702 | spectral_norm_est_t4 = 0.0031792
+G name = 'module._orig_mod.blocks.9.attn.c_v.weight' | median_sv = 0.0000058 | spectral_norm = 0.0081033 | frobenius_norm = 0.0083016 | spectral_norm_est_t2 = 0.0081042 | spectral_norm_est_t4 = 0.0081034
+G name = 'module._orig_mod.blocks.9.attn.c_proj.weight' | median_sv = 0.0000371 | spectral_norm = 0.0128954 | frobenius_norm = 0.0135661 | spectral_norm_est_t2 = 0.0128983 | spectral_norm_est_t4 = 0.0128957
+G name = 'module._orig_mod.blocks.9.mlp.c_fc.weight' | median_sv = 0.0000404 | spectral_norm = 0.0082264 | frobenius_norm = 0.0095329 | spectral_norm_est_t2 = 0.0082446 | spectral_norm_est_t4 = 0.0082285
+G name = 'module._orig_mod.blocks.9.mlp.c_proj.weight' | median_sv = 0.0000721 | spectral_norm = 0.0175391 | frobenius_norm = 0.0194011 | spectral_norm_est_t2 = 0.0175563 | spectral_norm_est_t4 = 0.0175417
+G name = 'module._orig_mod.blocks.10.attn.c_q.weight' | median_sv = 0.0000417 | spectral_norm = 0.0119951 | frobenius_norm = 0.0136054 | spectral_norm_est_t2 = 0.0120166 | spectral_norm_est_t4 = 0.0119949
+G name = 'module._orig_mod.blocks.10.attn.c_k.weight' | median_sv = 0.0000462 | spectral_norm = 0.0067049 | frobenius_norm = 0.0106224 | spectral_norm_est_t2 = 0.0070941 | spectral_norm_est_t4 = 0.0067294
+G name = 'module._orig_mod.blocks.10.attn.c_v.weight' | median_sv = 0.0000089 | spectral_norm = 0.0124951 | frobenius_norm = 0.0127644 | spectral_norm_est_t2 = 0.0124959 | spectral_norm_est_t4 = 0.0124952
+G name = 'module._orig_mod.blocks.10.attn.c_proj.weight' | median_sv = 0.0000644 | spectral_norm = 0.0311419 | frobenius_norm = 0.0320697 | spectral_norm_est_t2 = 0.0311432 | spectral_norm_est_t4 = 0.0311409
+G name = 'module._orig_mod.blocks.10.mlp.c_fc.weight' | median_sv = 0.0000621 | spectral_norm = 0.0151725 | frobenius_norm = 0.0168428 | spectral_norm_est_t2 = 0.0151882 | spectral_norm_est_t4 = 0.0151728
+G name = 'module._orig_mod.blocks.10.mlp.c_proj.weight' | median_sv = 0.0001074 | spectral_norm = 0.0348525 | frobenius_norm = 0.0377997 | spectral_norm_est_t2 = 0.0348870 | spectral_norm_est_t4 = 0.0348588
+G name = 'module._orig_mod.blocks.11.attn.c_q.weight' | median_sv = 0.0000363 | spectral_norm = 0.0120886 | frobenius_norm = 0.0130748 | spectral_norm_est_t2 = 0.0121004 | spectral_norm_est_t4 = 0.0120887
+G name = 'module._orig_mod.blocks.11.attn.c_k.weight' | median_sv = 0.0000396 | spectral_norm = 0.0054026 | frobenius_norm = 0.0086766 | spectral_norm_est_t2 = 0.0059988 | spectral_norm_est_t4 = 0.0055345
+G name = 'module._orig_mod.blocks.11.attn.c_v.weight' | median_sv = 0.0000101 | spectral_norm = 0.0157591 | frobenius_norm = 0.0160198 | spectral_norm_est_t2 = 0.0157602 | spectral_norm_est_t4 = 0.0157594
+G name = 'module._orig_mod.blocks.11.attn.c_proj.weight' | median_sv = 0.0000546 | spectral_norm = 0.0461732 | frobenius_norm = 0.0467030 | spectral_norm_est_t2 = 0.0461759 | spectral_norm_est_t4 = 0.0461752
+G name = 'module._orig_mod.blocks.11.mlp.c_fc.weight' | median_sv = 0.0000776 | spectral_norm = 0.0236908 | frobenius_norm = 0.0256372 | spectral_norm_est_t2 = 0.0237090 | spectral_norm_est_t4 = 0.0236910
+G name = 'module._orig_mod.blocks.11.mlp.c_proj.weight' | median_sv = 0.0001283 | spectral_norm = 0.0606808 | frobenius_norm = 0.0639195 | spectral_norm_est_t2 = 0.0607129 | spectral_norm_est_t4 = 0.0606916
+G name = 'module._orig_mod.value_embeds.weight' | l1_to_l2_norm = 0.0000004
+G name = 'module._orig_mod.lm_head.weight' | median_sv = 0.0005228 | spectral_norm = 0.1939544 | frobenius_norm = 0.2172057 | spectral_norm_est_t2 = 0.1947593 | spectral_norm_est_t4 = 0.1939621
+saved grads to logs/1ef9fb63-cc79-4219-bbf9-a03b83709afa/grad_state_step000125.pt
+===========================================
+step:126/1480 train_time:32179ms step_avg:277.41ms
+step:127/1480 train_time:32447ms step_avg:277.32ms
+step:128/1480 train_time:32731ms step_avg:277.38ms
+step:129/1480 train_time:33013ms step_avg:277.42ms
+step:130/1480 train_time:33300ms step_avg:277.50ms
+step:131/1480 train_time:33583ms step_avg:277.55ms
+step:132/1480 train_time:33867ms step_avg:277.60ms
+step:133/1480 train_time:34150ms step_avg:277.64ms
+step:134/1480 train_time:34437ms step_avg:277.71ms
+step:135/1480 train_time:34721ms step_avg:277.77ms
+step:136/1480 train_time:35005ms step_avg:277.82ms
+step:137/1480 train_time:35288ms step_avg:277.86ms
+step:138/1480 train_time:35573ms step_avg:277.91ms
+step:139/1480 train_time:35857ms step_avg:277.96ms
+step:140/1480 train_time:36141ms step_avg:278.00ms
+step:141/1480 train_time:36424ms step_avg:278.05ms
+step:142/1480 train_time:36708ms step_avg:278.09ms
+step:143/1480 train_time:36992ms step_avg:278.14ms
+step:144/1480 train_time:37277ms step_avg:278.19ms
+step:145/1480 train_time:37562ms step_avg:278.24ms
+step:146/1480 train_time:37845ms step_avg:278.27ms
+step:147/1480 train_time:38128ms step_avg:278.31ms
+step:148/1480 train_time:38414ms step_avg:278.36ms
+step:149/1480 train_time:38701ms step_avg:278.43ms
+step:150/1480 train_time:38984ms step_avg:278.45ms
+step:151/1480 train_time:39268ms step_avg:278.50ms
+step:152/1480 train_time:39553ms step_avg:278.54ms
+step:153/1480 train_time:39839ms step_avg:278.59ms
+step:154/1480 train_time:40123ms step_avg:278.63ms
+step:155/1480 train_time:40406ms step_avg:278.66ms
+step:156/1480 train_time:40690ms step_avg:278.70ms
+step:157/1480 train_time:40975ms step_avg:278.74ms
+step:158/1480 train_time:41259ms step_avg:278.78ms
+step:159/1480 train_time:41543ms step_avg:278.81ms
+step:160/1480 train_time:41826ms step_avg:278.84ms
+step:161/1480 train_time:42112ms step_avg:278.89ms
+step:162/1480 train_time:42396ms step_avg:278.92ms
+step:163/1480 train_time:42679ms step_avg:278.95ms
+step:164/1480 train_time:42966ms step_avg:279.00ms
+step:165/1480 train_time:43250ms step_avg:279.03ms
+step:166/1480 train_time:43535ms step_avg:279.07ms
+step:167/1480 train_time:43819ms step_avg:279.10ms
+step:168/1480 train_time:44103ms step_avg:279.14ms
+step:169/1480 train_time:44387ms step_avg:279.16ms
+step:170/1480 train_time:44673ms step_avg:279.21ms
+step:171/1480 train_time:44958ms step_avg:279.24ms
+step:172/1480 train_time:45243ms step_avg:279.28ms
+step:173/1480 train_time:45527ms step_avg:279.30ms
+step:174/1480 train_time:45813ms step_avg:279.35ms
+step:175/1480 train_time:46098ms step_avg:279.38ms
+step:176/1480 train_time:46382ms step_avg:279.41ms
+step:177/1480 train_time:46665ms step_avg:279.43ms
+step:178/1480 train_time:46950ms step_avg:279.46ms
+step:179/1480 train_time:47235ms step_avg:279.49ms
+step:180/1480 train_time:47520ms step_avg:279.53ms
+step:181/1480 train_time:47804ms step_avg:279.56ms
+step:182/1480 train_time:48088ms step_avg:279.58ms
+step:183/1480 train_time:48375ms step_avg:279.62ms
+step:184/1480 train_time:48661ms step_avg:279.66ms
+step:185/1480 train_time:48945ms step_avg:279.69ms
+step:186/1480 train_time:49228ms step_avg:279.71ms
+step:187/1480 train_time:49513ms step_avg:279.73ms
+step:188/1480 train_time:49798ms step_avg:279.76ms
+step:189/1480 train_time:50083ms step_avg:279.79ms
+step:190/1480 train_time:50366ms step_avg:279.81ms
+step:191/1480 train_time:50650ms step_avg:279.84ms
+step:192/1480 train_time:50935ms step_avg:279.86ms
+step:193/1480 train_time:51221ms step_avg:279.90ms
+step:194/1480 train_time:51506ms step_avg:279.93ms
+step:195/1480 train_time:51791ms step_avg:279.95ms
+step:196/1480 train_time:52076ms step_avg:279.98ms
+step:197/1480 train_time:52361ms step_avg:280.01ms
+step:198/1480 train_time:52645ms step_avg:280.03ms
+step:199/1480 train_time:52930ms step_avg:280.05ms
+step:200/1480 train_time:53215ms step_avg:280.08ms
+step:201/1480 train_time:53500ms step_avg:280.11ms
+step:202/1480 train_time:53784ms step_avg:280.13ms
+step:203/1480 train_time:54068ms step_avg:280.14ms
+step:204/1480 train_time:54354ms step_avg:280.17ms
+step:205/1480 train_time:54640ms step_avg:280.21ms
+step:206/1480 train_time:54925ms step_avg:280.23ms
+step:207/1480 train_time:55209ms step_avg:280.25ms
+step:208/1480 train_time:55493ms step_avg:280.27ms
+step:209/1480 train_time:55777ms step_avg:280.29ms
+step:210/1480 train_time:56062ms step_avg:280.31ms
+step:211/1480 train_time:56347ms step_avg:280.33ms
+step:212/1480 train_time:56631ms step_avg:280.35ms
+step:213/1480 train_time:56918ms step_avg:280.38ms
+step:214/1480 train_time:57203ms step_avg:280.41ms
+step:215/1480 train_time:57487ms step_avg:280.42ms
+step:216/1480 train_time:57771ms step_avg:280.44ms
+step:217/1480 train_time:58058ms step_avg:280.47ms
+step:218/1480 train_time:58342ms step_avg:280.49ms
+step:219/1480 train_time:58626ms step_avg:280.51ms
+step:220/1480 train_time:58913ms step_avg:280.54ms
+step:221/1480 train_time:59206ms step_avg:280.60ms
+step:222/1480 train_time:59501ms step_avg:280.67ms
+step:223/1480 train_time:59793ms step_avg:280.72ms
+step:224/1480 train_time:60086ms step_avg:280.78ms
+step:225/1480 train_time:60382ms step_avg:280.85ms
+step:226/1480 train_time:60672ms step_avg:280.89ms
+step:227/1480 train_time:60965ms step_avg:280.94ms
+step:228/1480 train_time:61258ms step_avg:281.00ms
+step:229/1480 train_time:61553ms step_avg:281.06ms
+step:230/1480 train_time:61844ms step_avg:281.11ms
+step:231/1480 train_time:62136ms step_avg:281.16ms
+step:232/1480 train_time:62428ms step_avg:281.21ms
+step:233/1480 train_time:62722ms step_avg:281.26ms
+step:234/1480 train_time:63015ms step_avg:281.32ms
+step:235/1480 train_time:63307ms step_avg:281.36ms
+step:236/1480 train_time:63599ms step_avg:281.41ms
+step:237/1480 train_time:63891ms step_avg:281.46ms
+step:238/1480 train_time:64184ms step_avg:281.51ms
+step:239/1480 train_time:64478ms step_avg:281.57ms
+step:240/1480 train_time:64769ms step_avg:281.61ms
+step:241/1480 train_time:65063ms step_avg:281.66ms
+step:242/1480 train_time:65360ms step_avg:281.72ms
+step:243/1480 train_time:65651ms step_avg:281.77ms
+step:244/1480 train_time:65944ms step_avg:281.81ms
+step:245/1480 train_time:66237ms step_avg:281.86ms
+step:246/1480 train_time:66529ms step_avg:281.90ms
+step:247/1480 train_time:66825ms step_avg:281.96ms
+step:248/1480 train_time:67120ms step_avg:282.01ms
+step:249/1480 train_time:67412ms step_avg:282.06ms
+step:250/1480 train_time:67705ms step_avg:282.10ms
+step:250/1480 val_loss:3.9828 train_time:67720ms step_avg:282.17ms
+============== Weight norms: ==============
+W name = 'module._orig_mod.embed.weight' | l1_to_l2_norm = 143.0942535
+W name = 'module._orig_mod.blocks.0.attn.c_q.weight' | median_sv = 1.6693283 | spectral_norm = 6.3664284 | frobenius_norm = 58.0284576
+W name = 'module._orig_mod.blocks.0.attn.c_k.weight' | median_sv = 1.5068584 | spectral_norm = 8.7662935 | frobenius_norm = 54.0010109
+W name = 'module._orig_mod.blocks.0.attn.c_v.weight' | median_sv = 1.5925086 | spectral_norm = 4.8817196 | frobenius_norm = 56.8431702
+W name = 'module._orig_mod.blocks.0.attn.c_proj.weight' | median_sv = 1.6966890 | spectral_norm = 4.3275337 | frobenius_norm = 57.2730331
+W name = 'module._orig_mod.blocks.0.mlp.c_fc.weight' | median_sv = 3.7200258 | spectral_norm = 8.3606224 | frobenius_norm = 110.4001541
+W name = 'module._orig_mod.blocks.0.mlp.c_proj.weight' | median_sv = 1.9756479 | spectral_norm = 4.7472849 | frobenius_norm = 59.6769028
+W name = 'module._orig_mod.blocks.1.attn.c_q.weight' | median_sv = 1.6088168 | spectral_norm = 5.4254441 | frobenius_norm = 56.5933571
+W name = 'module._orig_mod.blocks.1.attn.c_k.weight' | median_sv = 1.5566987 | spectral_norm = 6.1070971 | frobenius_norm = 54.7220688
+W name = 'module._orig_mod.blocks.1.attn.c_v.weight' | median_sv = 1.4364032 | spectral_norm = 5.2589922 | frobenius_norm = 56.3899155
+W name = 'module._orig_mod.blocks.1.attn.c_proj.weight' | median_sv = 1.7517426 | spectral_norm = 4.2997694 | frobenius_norm = 59.9881287
+W name = 'module._orig_mod.blocks.1.mlp.c_fc.weight' | median_sv = 4.2251768 | spectral_norm = 8.7766943 | frobenius_norm = 124.5469666
+W name = 'module._orig_mod.blocks.1.mlp.c_proj.weight' | median_sv = 2.1520937 | spectral_norm = 5.3396840 | frobenius_norm = 64.7262650
+W name = 'module._orig_mod.blocks.2.attn.c_q.weight' | median_sv = 1.5574962 | spectral_norm = 4.7545543 | frobenius_norm = 56.6190605
+W name = 'module._orig_mod.blocks.2.attn.c_k.weight' | median_sv = 1.5771535 | spectral_norm = 4.6876287 | frobenius_norm = 56.6016769
+W name = 'module._orig_mod.blocks.2.attn.c_v.weight' | median_sv = 1.5103252 | spectral_norm = 5.9063487 | frobenius_norm = 60.3456039
+W name = 'module._orig_mod.blocks.2.attn.c_proj.weight' | median_sv = 1.8896352 | spectral_norm = 4.6570768 | frobenius_norm = 63.9297180
+W name = 'module._orig_mod.blocks.2.mlp.c_fc.weight' | median_sv = 4.3713083 | spectral_norm = 8.9312706 | frobenius_norm = 128.6984253
+W name = 'module._orig_mod.blocks.2.mlp.c_proj.weight' | median_sv = 2.1703172 | spectral_norm = 5.3630352 | frobenius_norm = 65.1386032
+W name = 'module._orig_mod.blocks.3.attn.c_q.weight' | median_sv = 1.5853715 | spectral_norm = 5.4843836 | frobenius_norm = 56.2914162
+W name = 'module._orig_mod.blocks.3.attn.c_k.weight' | median_sv = 1.5671750 | spectral_norm = 5.1684833 | frobenius_norm = 55.1968269
+W name = 'module._orig_mod.blocks.3.attn.c_v.weight' | median_sv = 1.5162200 | spectral_norm = 5.9231095 | frobenius_norm = 61.6019402
+W name = 'module._orig_mod.blocks.3.attn.c_proj.weight' | median_sv = 1.7979198 | spectral_norm = 4.6135840 | frobenius_norm = 61.6978836
+W name = 'module._orig_mod.blocks.3.mlp.c_fc.weight' | median_sv = 4.4309707 | spectral_norm = 8.9559364 | frobenius_norm = 130.4732971
+W name = 'module._orig_mod.blocks.3.mlp.c_proj.weight' | median_sv = 2.2091758 | spectral_norm = 5.2980852 | frobenius_norm = 66.2455673
+W name = 'module._orig_mod.blocks.4.attn.c_q.weight' | median_sv = 1.5426515 | spectral_norm = 4.9368682 | frobenius_norm = 55.6232834
+W name = 'module._orig_mod.blocks.4.attn.c_k.weight' | median_sv = 1.5616012 | spectral_norm = 4.8419380 | frobenius_norm = 56.1376991
+W name = 'module._orig_mod.blocks.4.attn.c_v.weight' | median_sv = 1.5296651 | spectral_norm = 6.0926423 | frobenius_norm = 62.5294685
+W name = 'module._orig_mod.blocks.4.attn.c_proj.weight' | median_sv = 1.8512228 | spectral_norm = 4.7037077 | frobenius_norm = 63.5359688
+W name = 'module._orig_mod.blocks.4.mlp.c_fc.weight' | median_sv = 4.5003166 | spectral_norm = 9.0537853 | frobenius_norm = 132.3245392
+W name = 'module._orig_mod.blocks.4.mlp.c_proj.weight' | median_sv = 2.2088142 | spectral_norm = 5.3253226 | frobenius_norm = 66.3516006
+W name = 'module._orig_mod.blocks.5.attn.c_q.weight' | median_sv = 1.5734905 | spectral_norm = 5.1973343 | frobenius_norm = 55.9161453
+W name = 'module._orig_mod.blocks.5.attn.c_k.weight' | median_sv = 1.5700107 | spectral_norm = 4.8423753 | frobenius_norm = 55.8156395
+W name = 'module._orig_mod.blocks.5.attn.c_v.weight' | median_sv = 1.5659083 | spectral_norm = 6.3161683 | frobenius_norm = 62.6359215
+W name = 'module._orig_mod.blocks.5.attn.c_proj.weight' | median_sv = 1.8474112 | spectral_norm = 4.6815009 | frobenius_norm = 62.7218399
+W name = 'module._orig_mod.blocks.5.mlp.c_fc.weight' | median_sv = 4.5297976 | spectral_norm = 9.1577711 | frobenius_norm = 133.2791290
+W name = 'module._orig_mod.blocks.5.mlp.c_proj.weight' | median_sv = 2.2050202 | spectral_norm = 5.2065711 | frobenius_norm = 66.3323059
+W name = 'module._orig_mod.blocks.6.attn.c_q.weight' | median_sv = 1.5851610 | spectral_norm = 4.9997845 | frobenius_norm = 56.1557274
+W name = 'module._orig_mod.blocks.6.attn.c_k.weight' | median_sv = 1.5866168 | spectral_norm = 4.7587175 | frobenius_norm = 56.1287460
+W name = 'module._orig_mod.blocks.6.attn.c_v.weight' | median_sv = 1.5266360 | spectral_norm = 6.3076053 | frobenius_norm = 62.4429169
+W name = 'module._orig_mod.blocks.6.attn.c_proj.weight' | median_sv = 1.8222027 | spectral_norm = 4.6650176 | frobenius_norm = 62.1681519
+W name = 'module._orig_mod.blocks.6.mlp.c_fc.weight' | median_sv = 4.5367975 | spectral_norm = 9.6398287 | frobenius_norm = 134.1928101
+W name = 'module._orig_mod.blocks.6.mlp.c_proj.weight' | median_sv = 2.1996024 | spectral_norm = 5.3865070 | frobenius_norm = 66.5515594
+W name = 'module._orig_mod.blocks.7.attn.c_q.weight' | median_sv = 1.6123382 | spectral_norm = 5.3730874 | frobenius_norm = 56.6538124
+W name = 'module._orig_mod.blocks.7.attn.c_k.weight' | median_sv = 1.6099582 | spectral_norm = 4.8277087 | frobenius_norm = 56.8520393
+W name = 'module._orig_mod.blocks.7.attn.c_v.weight' | median_sv = 1.4844688 | spectral_norm = 6.1857934 | frobenius_norm = 61.3796158
+W name = 'module._orig_mod.blocks.7.attn.c_proj.weight' | median_sv = 1.8468071 | spectral_norm = 4.8193741 | frobenius_norm = 63.1674347
+W name = 'module._orig_mod.blocks.7.mlp.c_fc.weight' | median_sv = 4.5660062 | spectral_norm = 9.4487162 | frobenius_norm = 135.3545380
+W name = 'module._orig_mod.blocks.7.mlp.c_proj.weight' | median_sv = 2.2060025 | spectral_norm = 5.4023442 | frobenius_norm = 66.5740662
+W name = 'module._orig_mod.blocks.8.attn.c_q.weight' | median_sv = 1.5957140 | spectral_norm = 5.0184612 | frobenius_norm = 56.6746445
+W name = 'module._orig_mod.blocks.8.attn.c_k.weight' | median_sv = 1.5798777 | spectral_norm = 4.9796185 | frobenius_norm = 56.5090675
+W name = 'module._orig_mod.blocks.8.attn.c_v.weight' | median_sv = 1.5150222 | spectral_norm = 6.3233237 | frobenius_norm = 60.9901886
+W name = 'module._orig_mod.blocks.8.attn.c_proj.weight' | median_sv = 1.8668763 | spectral_norm = 4.7264214 | frobenius_norm = 62.7993660
+W name = 'module._orig_mod.blocks.8.mlp.c_fc.weight' | median_sv = 4.5496464 | spectral_norm = 9.7034435 | frobenius_norm = 134.8903198
+W name = 'module._orig_mod.blocks.8.mlp.c_proj.weight' | median_sv = 2.1915164 | spectral_norm = 5.4009824 | frobenius_norm = 66.2165222
+W name = 'module._orig_mod.blocks.9.attn.c_q.weight' | median_sv = 1.6246377 | spectral_norm = 5.0704641 | frobenius_norm = 57.6339455
+W name = 'module._orig_mod.blocks.9.attn.c_k.weight' | median_sv = 1.6315678 | spectral_norm = 5.3576970 | frobenius_norm = 57.6825294
+W name = 'module._orig_mod.blocks.9.attn.c_v.weight' | median_sv = 1.5602948 | spectral_norm = 5.6539240 | frobenius_norm = 61.0260277
+W name = 'module._orig_mod.blocks.9.attn.c_proj.weight' | median_sv = 1.9235189 | spectral_norm = 4.5111523 | frobenius_norm = 64.2803497
+W name = 'module._orig_mod.blocks.9.mlp.c_fc.weight' | median_sv = 4.5548992 | spectral_norm = 9.4852552 | frobenius_norm = 134.7669373
+W name = 'module._orig_mod.blocks.9.mlp.c_proj.weight' | median_sv = 2.1972289 | spectral_norm = 5.6059265 | frobenius_norm = 66.0983429
+W name = 'module._orig_mod.blocks.10.attn.c_q.weight' | median_sv = 1.4900438 | spectral_norm = 5.3380461 | frobenius_norm = 55.9096069
+W name = 'module._orig_mod.blocks.10.attn.c_k.weight' | median_sv = 1.4391666 | spectral_norm = 5.3713484 | frobenius_norm = 55.6836319
+W name = 'module._orig_mod.blocks.10.attn.c_v.weight' | median_sv = 1.4973611 | spectral_norm = 5.7010784 | frobenius_norm = 58.8023491
+W name = 'module._orig_mod.blocks.10.attn.c_proj.weight' | median_sv = 1.9836871 | spectral_norm = 4.7700305 | frobenius_norm = 68.5466766
+W name = 'module._orig_mod.blocks.10.mlp.c_fc.weight' | median_sv = 4.5207262 | spectral_norm = 9.4927425 | frobenius_norm = 133.0261078
+W name = 'module._orig_mod.blocks.10.mlp.c_proj.weight' | median_sv = 2.1735668 | spectral_norm = 5.7081761 | frobenius_norm = 65.1859741
+W name = 'module._orig_mod.blocks.11.attn.c_q.weight' | median_sv = 1.6027300 | spectral_norm = 5.3293056 | frobenius_norm = 57.0929375
+W name = 'module._orig_mod.blocks.11.attn.c_k.weight' | median_sv = 1.5376846 | spectral_norm = 5.6230969 | frobenius_norm = 56.3102264
+W name = 'module._orig_mod.blocks.11.attn.c_v.weight' | median_sv = 1.4641552 | spectral_norm = 5.4479518 | frobenius_norm = 57.0327072
+W name = 'module._orig_mod.blocks.11.attn.c_proj.weight' | median_sv = 1.9340340 | spectral_norm = 4.7138267 | frobenius_norm = 66.1713486
+W name = 'module._orig_mod.blocks.11.mlp.c_fc.weight' | median_sv = 4.4879193 | spectral_norm = 9.9753637 | frobenius_norm = 132.3330383
+W name = 'module._orig_mod.blocks.11.mlp.c_proj.weight' | median_sv = 2.1414394 | spectral_norm = 5.6524272 | frobenius_norm = 64.8283539
+W name = 'module._orig_mod.value_embeds.weight' | l1_to_l2_norm = 204.1575165
+W name = 'module._orig_mod.lm_head.weight' | median_sv = 16.2632618 | spectral_norm = 150.5301361 | frobenius_norm = 558.7553101
+===========================================
+============== Gradient norms: ==============
+G name = 'module._orig_mod.embed.weight' | l1_to_l2_norm = 0.0000003
+G name = 'module._orig_mod.blocks.0.attn.c_q.weight' | median_sv = 0.0000224 | spectral_norm = 0.0020376 | frobenius_norm = 0.0029339 | spectral_norm_est_t2 = 0.0020615 | spectral_norm_est_t4 = 0.0020376
+G name = 'module._orig_mod.blocks.0.attn.c_k.weight' | median_sv = 0.0000229 | spectral_norm = 0.0015689 | frobenius_norm = 0.0028602 | spectral_norm_est_t2 = 0.0016921 | spectral_norm_est_t4 = 0.0015777
+G name = 'module._orig_mod.blocks.0.attn.c_v.weight' | median_sv = 0.0000181 | spectral_norm = 0.0084380 | frobenius_norm = 0.0089254 | spectral_norm_est_t2 = 0.0084431 | spectral_norm_est_t4 = 0.0084376
+G name = 'module._orig_mod.blocks.0.attn.c_proj.weight' | median_sv = 0.0000493 | spectral_norm = 0.0179844 | frobenius_norm = 0.0187339 | spectral_norm_est_t2 = 0.0179854 | spectral_norm_est_t4 = 0.0179838
+G name = 'module._orig_mod.blocks.0.mlp.c_fc.weight' | median_sv = 0.0000824 | spectral_norm = 0.0069500 | frobenius_norm = 0.0083312 | spectral_norm_est_t2 = 0.0069571 | spectral_norm_est_t4 = 0.0069498
+G name = 'module._orig_mod.blocks.0.mlp.c_proj.weight' | median_sv = 0.0001358 | spectral_norm = 0.0070959 | frobenius_norm = 0.0100361 | spectral_norm_est_t2 = 0.0071288 | spectral_norm_est_t4 = 0.0070980
+G name = 'module._orig_mod.blocks.1.attn.c_q.weight' | median_sv = 0.0000140 | spectral_norm = 0.0047718 | frobenius_norm = 0.0051347 | spectral_norm_est_t2 = 0.0047753 | spectral_norm_est_t4 = 0.0047717
+G name = 'module._orig_mod.blocks.1.attn.c_k.weight' | median_sv = 0.0000155 | spectral_norm = 0.0024896 | frobenius_norm = 0.0036966 | spectral_norm_est_t2 = 0.0027055 | spectral_norm_est_t4 = 0.0025301
+G name = 'module._orig_mod.blocks.1.attn.c_v.weight' | median_sv = 0.0000257 | spectral_norm = 0.0206049 | frobenius_norm = 0.0210715 | spectral_norm_est_t2 = 0.0206062 | spectral_norm_est_t4 = 0.0206047
+G name = 'module._orig_mod.blocks.1.attn.c_proj.weight' | median_sv = 0.0000464 | spectral_norm = 0.0093353 | frobenius_norm = 0.0113673 | spectral_norm_est_t2 = 0.0093719 | spectral_norm_est_t4 = 0.0093351
+G name = 'module._orig_mod.blocks.1.mlp.c_fc.weight' | median_sv = 0.0000599 | spectral_norm = 0.0064678 | frobenius_norm = 0.0078081 | spectral_norm_est_t2 = 0.0064765 | spectral_norm_est_t4 = 0.0064677
+G name = 'module._orig_mod.blocks.1.mlp.c_proj.weight' | median_sv = 0.0001098 | spectral_norm = 0.0068105 | frobenius_norm = 0.0095527 | spectral_norm_est_t2 = 0.0068649 | spectral_norm_est_t4 = 0.0068113
+G name = 'module._orig_mod.blocks.2.attn.c_q.weight' | median_sv = 0.0000215 | spectral_norm = 0.0117831 | frobenius_norm = 0.0123244 | spectral_norm_est_t2 = 0.0117848 | spectral_norm_est_t4 = 0.0117826
+G name = 'module._orig_mod.blocks.2.attn.c_k.weight' | median_sv = 0.0000227 | spectral_norm = 0.0037966 | frobenius_norm = 0.0059276 | spectral_norm_est_t2 = 0.0041417 | spectral_norm_est_t4 = 0.0038586
+G name = 'module._orig_mod.blocks.2.attn.c_v.weight' | median_sv = 0.0000189 | spectral_norm = 0.0191578 | frobenius_norm = 0.0195661 | spectral_norm_est_t2 = 0.0191593 | spectral_norm_est_t4 = 0.0191582
+G name = 'module._orig_mod.blocks.2.attn.c_proj.weight' | median_sv = 0.0000475 | spectral_norm = 0.0084215 | frobenius_norm = 0.0103525 | spectral_norm_est_t2 = 0.0084717 | spectral_norm_est_t4 = 0.0084214
+G name = 'module._orig_mod.blocks.2.mlp.c_fc.weight' | median_sv = 0.0000654 | spectral_norm = 0.0091571 | frobenius_norm = 0.0104805 | spectral_norm_est_t2 = 0.0091665 | spectral_norm_est_t4 = 0.0091575
+G name = 'module._orig_mod.blocks.2.mlp.c_proj.weight' | median_sv = 0.0001196 | spectral_norm = 0.0089844 | frobenius_norm = 0.0117584 | spectral_norm_est_t2 = 0.0090236 | spectral_norm_est_t4 = 0.0089851
+G name = 'module._orig_mod.blocks.3.attn.c_q.weight' | median_sv = 0.0000159 | spectral_norm = 0.0030697 | frobenius_norm = 0.0035984 | spectral_norm_est_t2 = 0.0030738 | spectral_norm_est_t4 = 0.0030696
+G name = 'module._orig_mod.blocks.3.attn.c_k.weight' | median_sv = 0.0000173 | spectral_norm = 0.0016529 | frobenius_norm = 0.0029197 | spectral_norm_est_t2 = 0.0017853 | spectral_norm_est_t4 = 0.0016631
+G name = 'module._orig_mod.blocks.3.attn.c_v.weight' | median_sv = 0.0000211 | spectral_norm = 0.0187611 | frobenius_norm = 0.0192798 | spectral_norm_est_t2 = 0.0187634 | spectral_norm_est_t4 = 0.0187615
+G name = 'module._orig_mod.blocks.3.attn.c_proj.weight' | median_sv = 0.0000373 | spectral_norm = 0.0068087 | frobenius_norm = 0.0084955 | spectral_norm_est_t2 = 0.0068358 | spectral_norm_est_t4 = 0.0068086
+G name = 'module._orig_mod.blocks.3.mlp.c_fc.weight' | median_sv = 0.0000584 | spectral_norm = 0.0071534 | frobenius_norm = 0.0085834 | spectral_norm_est_t2 = 0.0071651 | spectral_norm_est_t4 = 0.0071545
+G name = 'module._orig_mod.blocks.3.mlp.c_proj.weight' | median_sv = 0.0001079 | spectral_norm = 0.0078989 | frobenius_norm = 0.0104712 | spectral_norm_est_t2 = 0.0079357 | spectral_norm_est_t4 = 0.0078994
+G name = 'module._orig_mod.blocks.4.attn.c_q.weight' | median_sv = 0.0000193 | spectral_norm = 0.0036529 | frobenius_norm = 0.0043036 | spectral_norm_est_t2 = 0.0036598 | spectral_norm_est_t4 = 0.0036528
+G name = 'module._orig_mod.blocks.4.attn.c_k.weight' | median_sv = 0.0000211 | spectral_norm = 0.0020599 | frobenius_norm = 0.0036785 | spectral_norm_est_t2 = 0.0022687 | spectral_norm_est_t4 = 0.0020872
+G name = 'module._orig_mod.blocks.4.attn.c_v.weight' | median_sv = 0.0000160 | spectral_norm = 0.0140925 | frobenius_norm = 0.0144571 | spectral_norm_est_t2 = 0.0140934 | spectral_norm_est_t4 = 0.0140926
+G name = 'module._orig_mod.blocks.4.attn.c_proj.weight' | median_sv = 0.0000346 | spectral_norm = 0.0063777 | frobenius_norm = 0.0077801 | spectral_norm_est_t2 = 0.0063976 | spectral_norm_est_t4 = 0.0063774
+G name = 'module._orig_mod.blocks.4.mlp.c_fc.weight' | median_sv = 0.0000563 | spectral_norm = 0.0074018 | frobenius_norm = 0.0088309 | spectral_norm_est_t2 = 0.0074140 | spectral_norm_est_t4 = 0.0074019
+G name = 'module._orig_mod.blocks.4.mlp.c_proj.weight' | median_sv = 0.0001052 | spectral_norm = 0.0075727 | frobenius_norm = 0.0102043 | spectral_norm_est_t2 = 0.0076129 | spectral_norm_est_t4 = 0.0075736
+G name = 'module._orig_mod.blocks.5.attn.c_q.weight' | median_sv = 0.0000151 | spectral_norm = 0.0021635 | frobenius_norm = 0.0028394 | spectral_norm_est_t2 = 0.0021796 | spectral_norm_est_t4 = 0.0021635
+G name = 'module._orig_mod.blocks.5.attn.c_k.weight' | median_sv = 0.0000164 | spectral_norm = 0.0014721 | frobenius_norm = 0.0027862 | spectral_norm_est_t2 = 0.0016556 | spectral_norm_est_t4 = 0.0014929
+G name = 'module._orig_mod.blocks.5.attn.c_v.weight' | median_sv = 0.0000153 | spectral_norm = 0.0124441 | frobenius_norm = 0.0128523 | spectral_norm_est_t2 = 0.0124457 | spectral_norm_est_t4 = 0.0124441
+G name = 'module._orig_mod.blocks.5.attn.c_proj.weight' | median_sv = 0.0000285 | spectral_norm = 0.0055650 | frobenius_norm = 0.0068603 | spectral_norm_est_t2 = 0.0055901 | spectral_norm_est_t4 = 0.0055648
+G name = 'module._orig_mod.blocks.5.mlp.c_fc.weight' | median_sv = 0.0000477 | spectral_norm = 0.0060050 | frobenius_norm = 0.0073405 | spectral_norm_est_t2 = 0.0060181 | spectral_norm_est_t4 = 0.0060052
+G name = 'module._orig_mod.blocks.5.mlp.c_proj.weight' | median_sv = 0.0000927 | spectral_norm = 0.0059464 | frobenius_norm = 0.0083740 | spectral_norm_est_t2 = 0.0059888 | spectral_norm_est_t4 = 0.0059476
+G name = 'module._orig_mod.blocks.6.attn.c_q.weight' | median_sv = 0.0000137 | spectral_norm = 0.0029027 | frobenius_norm = 0.0033932 | spectral_norm_est_t2 = 0.0029106 | spectral_norm_est_t4 = 0.0029026
+G name = 'module._orig_mod.blocks.6.attn.c_k.weight' | median_sv = 0.0000145 | spectral_norm = 0.0017908 | frobenius_norm = 0.0033071 | spectral_norm_est_t2 = 0.0021095 | spectral_norm_est_t4 = 0.0018570
+G name = 'module._orig_mod.blocks.6.attn.c_v.weight' | median_sv = 0.0000070 | spectral_norm = 0.0065976 | frobenius_norm = 0.0067898 | spectral_norm_est_t2 = 0.0065984 | spectral_norm_est_t4 = 0.0065977
+G name = 'module._orig_mod.blocks.6.attn.c_proj.weight' | median_sv = 0.0000251 | spectral_norm = 0.0036904 | frobenius_norm = 0.0045444 | spectral_norm_est_t2 = 0.0037035 | spectral_norm_est_t4 = 0.0036905
+G name = 'module._orig_mod.blocks.6.mlp.c_fc.weight' | median_sv = 0.0000409 | spectral_norm = 0.0046761 | frobenius_norm = 0.0057261 | spectral_norm_est_t2 = 0.0046858 | spectral_norm_est_t4 = 0.0046761
+G name = 'module._orig_mod.blocks.6.mlp.c_proj.weight' | median_sv = 0.0000797 | spectral_norm = 0.0052773 | frobenius_norm = 0.0073694 | spectral_norm_est_t2 = 0.0053214 | spectral_norm_est_t4 = 0.0052783
+G name = 'module._orig_mod.blocks.7.attn.c_q.weight' | median_sv = 0.0000119 | spectral_norm = 0.0018653 | frobenius_norm = 0.0023048 | spectral_norm_est_t2 = 0.0018715 | spectral_norm_est_t4 = 0.0018653
+G name = 'module._orig_mod.blocks.7.attn.c_k.weight' | median_sv = 0.0000125 | spectral_norm = 0.0012425 | frobenius_norm = 0.0021752 | spectral_norm_est_t2 = 0.0013657 | spectral_norm_est_t4 = 0.0012548
+G name = 'module._orig_mod.blocks.7.attn.c_v.weight' | median_sv = 0.0000101 | spectral_norm = 0.0081734 | frobenius_norm = 0.0084528 | spectral_norm_est_t2 = 0.0081747 | spectral_norm_est_t4 = 0.0081735
+G name = 'module._orig_mod.blocks.7.attn.c_proj.weight' | median_sv = 0.0000263 | spectral_norm = 0.0047242 | frobenius_norm = 0.0055335 | spectral_norm_est_t2 = 0.0047311 | spectral_norm_est_t4 = 0.0047244
+G name = 'module._orig_mod.blocks.7.mlp.c_fc.weight' | median_sv = 0.0000403 | spectral_norm = 0.0047175 | frobenius_norm = 0.0057543 | spectral_norm_est_t2 = 0.0047271 | spectral_norm_est_t4 = 0.0047175
+G name = 'module._orig_mod.blocks.7.mlp.c_proj.weight' | median_sv = 0.0000816 | spectral_norm = 0.0053017 | frobenius_norm = 0.0074662 | spectral_norm_est_t2 = 0.0053529 | spectral_norm_est_t4 = 0.0053029
+G name = 'module._orig_mod.blocks.8.attn.c_q.weight' | median_sv = 0.0000173 | spectral_norm = 0.0031634 | frobenius_norm = 0.0037445 | spectral_norm_est_t2 = 0.0031706 | spectral_norm_est_t4 = 0.0031633
+G name = 'module._orig_mod.blocks.8.attn.c_k.weight' | median_sv = 0.0000182 | spectral_norm = 0.0026330 | frobenius_norm = 0.0038151 | spectral_norm_est_t2 = 0.0027311 | spectral_norm_est_t4 = 0.0026371
+G name = 'module._orig_mod.blocks.8.attn.c_v.weight' | median_sv = 0.0000062 | spectral_norm = 0.0049770 | frobenius_norm = 0.0051459 | spectral_norm_est_t2 = 0.0049777 | spectral_norm_est_t4 = 0.0049771
+G name = 'module._orig_mod.blocks.8.attn.c_proj.weight' | median_sv = 0.0000367 | spectral_norm = 0.0063981 | frobenius_norm = 0.0072334 | spectral_norm_est_t2 = 0.0064035 | spectral_norm_est_t4 = 0.0063980
+G name = 'module._orig_mod.blocks.8.mlp.c_fc.weight' | median_sv = 0.0000435 | spectral_norm = 0.0052581 | frobenius_norm = 0.0062719 | spectral_norm_est_t2 = 0.0052669 | spectral_norm_est_t4 = 0.0052581
+G name = 'module._orig_mod.blocks.8.mlp.c_proj.weight' | median_sv = 0.0000872 | spectral_norm = 0.0060166 | frobenius_norm = 0.0082302 | spectral_norm_est_t2 = 0.0060667 | spectral_norm_est_t4 = 0.0060175
+G name = 'module._orig_mod.blocks.9.attn.c_q.weight' | median_sv = 0.0000160 | spectral_norm = 0.0026730 | frobenius_norm = 0.0031623 | spectral_norm_est_t2 = 0.0026783 | spectral_norm_est_t4 = 0.0026729
+G name = 'module._orig_mod.blocks.9.attn.c_k.weight' | median_sv = 0.0000169 | spectral_norm = 0.0017553 | frobenius_norm = 0.0028747 | spectral_norm_est_t2 = 0.0018850 | spectral_norm_est_t4 = 0.0017666
+G name = 'module._orig_mod.blocks.9.attn.c_v.weight' | median_sv = 0.0000057 | spectral_norm = 0.0043379 | frobenius_norm = 0.0044602 | spectral_norm_est_t2 = 0.0043383 | spectral_norm_est_t4 = 0.0043379
+G name = 'module._orig_mod.blocks.9.attn.c_proj.weight' | median_sv = 0.0000452 | spectral_norm = 0.0090158 | frobenius_norm = 0.0095693 | spectral_norm_est_t2 = 0.0090163 | spectral_norm_est_t4 = 0.0090153
+G name = 'module._orig_mod.blocks.9.mlp.c_fc.weight' | median_sv = 0.0000471 | spectral_norm = 0.0059857 | frobenius_norm = 0.0069458 | spectral_norm_est_t2 = 0.0059929 | spectral_norm_est_t4 = 0.0059857
+G name = 'module._orig_mod.blocks.9.mlp.c_proj.weight' | median_sv = 0.0000909 | spectral_norm = 0.0067379 | frobenius_norm = 0.0091631 | spectral_norm_est_t2 = 0.0068089 | spectral_norm_est_t4 = 0.0067390
+G name = 'module._orig_mod.blocks.10.attn.c_q.weight' | median_sv = 0.0000302 | spectral_norm = 0.0092257 | frobenius_norm = 0.0102490 | spectral_norm_est_t2 = 0.0092450 | spectral_norm_est_t4 = 0.0092255
+G name = 'module._orig_mod.blocks.10.attn.c_k.weight' | median_sv = 0.0000347 | spectral_norm = 0.0049714 | frobenius_norm = 0.0072532 | spectral_norm_est_t2 = 0.0051422 | spectral_norm_est_t4 = 0.0049767
+G name = 'module._orig_mod.blocks.10.attn.c_v.weight' | median_sv = 0.0000077 | spectral_norm = 0.0074189 | frobenius_norm = 0.0075867 | spectral_norm_est_t2 = 0.0074193 | spectral_norm_est_t4 = 0.0074189
+G name = 'module._orig_mod.blocks.10.attn.c_proj.weight' | median_sv = 0.0000622 | spectral_norm = 0.0274816 | frobenius_norm = 0.0279769 | spectral_norm_est_t2 = 0.0274819 | spectral_norm_est_t4 = 0.0274814
+G name = 'module._orig_mod.blocks.10.mlp.c_fc.weight' | median_sv = 0.0000625 | spectral_norm = 0.0126694 | frobenius_norm = 0.0135658 | spectral_norm_est_t2 = 0.0126734 | spectral_norm_est_t4 = 0.0126692
+G name = 'module._orig_mod.blocks.10.mlp.c_proj.weight' | median_sv = 0.0001116 | spectral_norm = 0.0120820 | frobenius_norm = 0.0150910 | spectral_norm_est_t2 = 0.0121674 | spectral_norm_est_t4 = 0.0120841
+G name = 'module._orig_mod.blocks.11.attn.c_q.weight' | median_sv = 0.0000263 | spectral_norm = 0.0117770 | frobenius_norm = 0.0121618 | spectral_norm_est_t2 = 0.0117783 | spectral_norm_est_t4 = 0.0117768
+G name = 'module._orig_mod.blocks.11.attn.c_k.weight' | median_sv = 0.0000285 | spectral_norm = 0.0063216 | frobenius_norm = 0.0075613 | spectral_norm_est_t2 = 0.0063964 | spectral_norm_est_t4 = 0.0063230
+G name = 'module._orig_mod.blocks.11.attn.c_v.weight' | median_sv = 0.0000098 | spectral_norm = 0.0100386 | frobenius_norm = 0.0101886 | spectral_norm_est_t2 = 0.0100389 | spectral_norm_est_t4 = 0.0100387
+G name = 'module._orig_mod.blocks.11.attn.c_proj.weight' | median_sv = 0.0000563 | spectral_norm = 0.0349008 | frobenius_norm = 0.0352918 | spectral_norm_est_t2 = 0.0349016 | spectral_norm_est_t4 = 0.0349013
+G name = 'module._orig_mod.blocks.11.mlp.c_fc.weight' | median_sv = 0.0000759 | spectral_norm = 0.0222263 | frobenius_norm = 0.0233081 | spectral_norm_est_t2 = 0.0222334 | spectral_norm_est_t4 = 0.0222262
+G name = 'module._orig_mod.blocks.11.mlp.c_proj.weight' | median_sv = 0.0001357 | spectral_norm = 0.0253729 | frobenius_norm = 0.0289369 | spectral_norm_est_t2 = 0.0254402 | spectral_norm_est_t4 = 0.0253778
+G name = 'module._orig_mod.value_embeds.weight' | l1_to_l2_norm = 0.0000003
+G name = 'module._orig_mod.lm_head.weight' | median_sv = 0.0004046 | spectral_norm = 0.2302675 | frobenius_norm = 0.2383341 | spectral_norm_est_t2 = 0.2303600 | spectral_norm_est_t4 = 0.2302691
+saved grads to logs/1ef9fb63-cc79-4219-bbf9-a03b83709afa/grad_state_step000250.pt
+===========================================
+step:251/1480 train_time:68022ms step_avg:282.25ms
+step:252/1480 train_time:68304ms step_avg:282.25ms
+step:253/1480 train_time:68594ms step_avg:282.28ms
+step:254/1480 train_time:68886ms step_avg:282.32ms
+step:255/1480 train_time:69176ms step_avg:282.35ms
+step:256/1480 train_time:69470ms step_avg:282.40ms
+step:257/1480 train_time:69763ms step_avg:282.44ms
+step:258/1480 train_time:70054ms step_avg:282.47ms
+step:259/1480 train_time:70348ms step_avg:282.52ms
+step:260/1480 train_time:70642ms step_avg:282.57ms
+step:261/1480 train_time:70933ms step_avg:282.60ms
+step:262/1480 train_time:71227ms step_avg:282.65ms
+step:263/1480 train_time:71520ms step_avg:282.69ms
+step:264/1480 train_time:71813ms step_avg:282.73ms
+step:265/1480 train_time:72104ms step_avg:282.76ms
+step:266/1480 train_time:72394ms step_avg:282.79ms
+step:267/1480 train_time:72687ms step_avg:282.83ms
+step:268/1480 train_time:72978ms step_avg:282.86ms
+step:269/1480 train_time:73271ms step_avg:282.90ms
+step:270/1480 train_time:73564ms step_avg:282.94ms
+step:271/1480 train_time:73856ms step_avg:282.97ms
+step:272/1480 train_time:74147ms step_avg:283.00ms
+step:273/1480 train_time:74439ms step_avg:283.04ms
+step:274/1480 train_time:74731ms step_avg:283.07ms
+step:275/1480 train_time:75027ms step_avg:283.12ms
+step:276/1480 train_time:75319ms step_avg:283.16ms
+step:277/1480 train_time:75611ms step_avg:283.19ms
+step:278/1480 train_time:75903ms step_avg:283.22ms
+step:279/1480 train_time:76196ms step_avg:283.26ms
+step:280/1480 train_time:76488ms step_avg:283.29ms
+step:281/1480 train_time:76782ms step_avg:283.33ms
+step:282/1480 train_time:77073ms step_avg:283.36ms
+step:283/1480 train_time:77366ms step_avg:283.39ms
+step:284/1480 train_time:77658ms step_avg:283.42ms
+step:285/1480 train_time:77951ms step_avg:283.46ms
+step:286/1480 train_time:78245ms step_avg:283.50ms
+step:287/1480 train_time:78536ms step_avg:283.52ms
+step:288/1480 train_time:78830ms step_avg:283.56ms
+step:289/1480 train_time:79124ms step_avg:283.60ms
+step:290/1480 train_time:79415ms step_avg:283.63ms
+step:291/1480 train_time:79711ms step_avg:283.67ms
+step:292/1480 train_time:80000ms step_avg:283.69ms
+step:293/1480 train_time:80292ms step_avg:283.72ms
+step:294/1480 train_time:80586ms step_avg:283.75ms
+step:295/1480 train_time:80881ms step_avg:283.79ms
+step:296/1480 train_time:81173ms step_avg:283.82ms
+step:297/1480 train_time:81466ms step_avg:283.85ms
+step:298/1480 train_time:81757ms step_avg:283.88ms
+step:299/1480 train_time:82050ms step_avg:283.91ms
+step:300/1480 train_time:82344ms step_avg:283.94ms
+step:301/1480 train_time:82638ms step_avg:283.98ms
+step:302/1480 train_time:82928ms step_avg:284.00ms
+step:303/1480 train_time:83219ms step_avg:284.02ms
+step:304/1480 train_time:83512ms step_avg:284.05ms
+step:305/1480 train_time:83806ms step_avg:284.09ms
+step:306/1480 train_time:84099ms step_avg:284.12ms
+step:307/1480 train_time:84390ms step_avg:284.14ms
+step:308/1480 train_time:84684ms step_avg:284.17ms
+step:309/1480 train_time:84974ms step_avg:284.19ms
+step:310/1480 train_time:85269ms step_avg:284.23ms
+step:311/1480 train_time:85563ms step_avg:284.26ms
+step:312/1480 train_time:85856ms step_avg:284.29ms
+step:313/1480 train_time:86148ms step_avg:284.32ms
+step:314/1480 train_time:86441ms step_avg:284.34ms
+step:315/1480 train_time:86733ms step_avg:284.37ms
+step:316/1480 train_time:87026ms step_avg:284.40ms
+step:317/1480 train_time:87319ms step_avg:284.43ms
+step:318/1480 train_time:87611ms step_avg:284.45ms
+step:319/1480 train_time:87905ms step_avg:284.48ms
+step:320/1480 train_time:88196ms step_avg:284.50ms
+step:321/1480 train_time:88489ms step_avg:284.53ms
+step:322/1480 train_time:88784ms step_avg:284.57ms
+step:323/1480 train_time:89078ms step_avg:284.59ms
+step:324/1480 train_time:89368ms step_avg:284.61ms
+step:325/1480 train_time:89661ms step_avg:284.64ms
+step:326/1480 train_time:89953ms step_avg:284.66ms
+step:327/1480 train_time:90247ms step_avg:284.69ms
+step:328/1480 train_time:90540ms step_avg:284.72ms
+step:329/1480 train_time:90833ms step_avg:284.74ms
+step:330/1480 train_time:91136ms step_avg:284.80ms
+step:331/1480 train_time:91436ms step_avg:284.85ms
+step:332/1480 train_time:91736ms step_avg:284.89ms
+step:333/1480 train_time:92035ms step_avg:284.94ms
+step:334/1480 train_time:92334ms step_avg:284.98ms
+step:335/1480 train_time:92636ms step_avg:285.03ms
+step:336/1480 train_time:92936ms step_avg:285.08ms
+step:337/1480 train_time:93237ms step_avg:285.13ms
+step:338/1480 train_time:93537ms step_avg:285.17ms
+step:339/1480 train_time:93836ms step_avg:285.22ms
+step:340/1480 train_time:94136ms step_avg:285.26ms
+step:341/1480 train_time:94436ms step_avg:285.31ms
+step:342/1480 train_time:94735ms step_avg:285.35ms
+step:343/1480 train_time:95036ms step_avg:285.39ms
+step:344/1480 train_time:95335ms step_avg:285.44ms
+step:345/1480 train_time:95636ms step_avg:285.48ms
+step:346/1480 train_time:95936ms step_avg:285.52ms
+step:347/1480 train_time:96237ms step_avg:285.57ms
+step:348/1480 train_time:96537ms step_avg:285.61ms
+step:349/1480 train_time:96836ms step_avg:285.65ms
+step:350/1480 train_time:97137ms step_avg:285.70ms
+step:351/1480 train_time:97436ms step_avg:285.74ms
+step:352/1480 train_time:97736ms step_avg:285.78ms
+step:353/1480 train_time:98036ms step_avg:285.82ms
+step:354/1480 train_time:98335ms step_avg:285.86ms
+step:355/1480 train_time:98637ms step_avg:285.90ms
+step:356/1480 train_time:98936ms step_avg:285.94ms
+step:357/1480 train_time:99237ms step_avg:285.98ms
+step:358/1480 train_time:99535ms step_avg:286.02ms
+step:359/1480 train_time:99837ms step_avg:286.07ms
+step:360/1480 train_time:100140ms step_avg:286.11ms
+step:361/1480 train_time:100437ms step_avg:286.15ms
+step:362/1480 train_time:100736ms step_avg:286.18ms
+step:363/1480 train_time:101036ms step_avg:286.22ms
+step:364/1480 train_time:101337ms step_avg:286.26ms
+step:365/1480 train_time:101636ms step_avg:286.30ms
+step:366/1480 train_time:101936ms step_avg:286.34ms
+step:367/1480 train_time:102236ms step_avg:286.38ms
+step:368/1480 train_time:102537ms step_avg:286.41ms
+step:369/1480 train_time:102837ms step_avg:286.45ms
+step:370/1480 train_time:103137ms step_avg:286.49ms
+step:371/1480 train_time:103436ms step_avg:286.53ms
+step:372/1480 train_time:103736ms step_avg:286.56ms
+step:373/1480 train_time:104037ms step_avg:286.60ms
+step:374/1480 train_time:104337ms step_avg:286.64ms
+step:375/1480 train_time:104636ms step_avg:286.67ms
+step:375/1480 val_loss:3.7982 train_time:104652ms step_avg:286.72ms
+============== Weight norms: ==============
+W name = 'module._orig_mod.embed.weight' | l1_to_l2_norm = 166.0495300
+W name = 'module._orig_mod.blocks.0.attn.c_q.weight' | median_sv = 2.3857007 | spectral_norm = 9.7124777 | frobenius_norm = 83.2639389
+W name = 'module._orig_mod.blocks.0.attn.c_k.weight' | median_sv = 2.1744247 | spectral_norm = 13.6057224 | frobenius_norm = 78.1223907
+W name = 'module._orig_mod.blocks.0.attn.c_v.weight' | median_sv = 2.3612499 | spectral_norm = 7.4964113 | frobenius_norm = 81.9753571
+W name = 'module._orig_mod.blocks.0.attn.c_proj.weight' | median_sv = 2.3899851 | spectral_norm = 6.3804293 | frobenius_norm = 81.3784714
+W name = 'module._orig_mod.blocks.0.mlp.c_fc.weight' | median_sv = 5.4726334 | spectral_norm = 11.5076208 | frobenius_norm = 162.5738678
+W name = 'module._orig_mod.blocks.0.mlp.c_proj.weight' | median_sv = 2.8675454 | spectral_norm = 7.1552739 | frobenius_norm = 86.7196198
+W name = 'module._orig_mod.blocks.1.attn.c_q.weight' | median_sv = 2.3523867 | spectral_norm = 8.0464697 | frobenius_norm = 82.7444000
+W name = 'module._orig_mod.blocks.1.attn.c_k.weight' | median_sv = 2.2869361 | spectral_norm = 8.7733154 | frobenius_norm = 80.2015610
+W name = 'module._orig_mod.blocks.1.attn.c_v.weight' | median_sv = 2.1155439 | spectral_norm = 7.4726491 | frobenius_norm = 80.9510956
+W name = 'module._orig_mod.blocks.1.attn.c_proj.weight' | median_sv = 2.4472315 | spectral_norm = 6.2229958 | frobenius_norm = 85.4254227
+W name = 'module._orig_mod.blocks.1.mlp.c_fc.weight' | median_sv = 6.1003866 | spectral_norm = 12.7508707 | frobenius_norm = 180.1448517
+W name = 'module._orig_mod.blocks.1.mlp.c_proj.weight' | median_sv = 3.0572701 | spectral_norm = 8.0940104 | frobenius_norm = 92.5819016
+W name = 'module._orig_mod.blocks.2.attn.c_q.weight' | median_sv = 2.2774282 | spectral_norm = 6.9992805 | frobenius_norm = 82.8692551
+W name = 'module._orig_mod.blocks.2.attn.c_k.weight' | median_sv = 2.2875788 | spectral_norm = 6.7427568 | frobenius_norm = 82.4020233
+W name = 'module._orig_mod.blocks.2.attn.c_v.weight' | median_sv = 2.2838178 | spectral_norm = 8.6033840 | frobenius_norm = 88.7944870
+W name = 'module._orig_mod.blocks.2.attn.c_proj.weight' | median_sv = 2.7155173 | spectral_norm = 6.6481562 | frobenius_norm = 92.0015793
+W name = 'module._orig_mod.blocks.2.mlp.c_fc.weight' | median_sv = 6.2894802 | spectral_norm = 13.0970688 | frobenius_norm = 184.9512024
+W name = 'module._orig_mod.blocks.2.mlp.c_proj.weight' | median_sv = 3.0442264 | spectral_norm = 7.8138189 | frobenius_norm = 91.8847809
+W name = 'module._orig_mod.blocks.3.attn.c_q.weight' | median_sv = 2.3324173 | spectral_norm = 8.2871943 | frobenius_norm = 82.5671768
+W name = 'module._orig_mod.blocks.3.attn.c_k.weight' | median_sv = 2.2888424 | spectral_norm = 7.6978798 | frobenius_norm = 80.5392990
+W name = 'module._orig_mod.blocks.3.attn.c_v.weight' | median_sv = 2.2954278 | spectral_norm = 8.2699776 | frobenius_norm = 89.2289505
+W name = 'module._orig_mod.blocks.3.attn.c_proj.weight' | median_sv = 2.5650563 | spectral_norm = 6.8024931 | frobenius_norm = 89.0003662
+W name = 'module._orig_mod.blocks.3.mlp.c_fc.weight' | median_sv = 6.4007988 | spectral_norm = 13.1789780 | frobenius_norm = 188.3818512
+W name = 'module._orig_mod.blocks.3.mlp.c_proj.weight' | median_sv = 3.1190338 | spectral_norm = 7.6763420 | frobenius_norm = 94.0673599
+W name = 'module._orig_mod.blocks.4.attn.c_q.weight' | median_sv = 2.2501273 | spectral_norm = 7.5130267 | frobenius_norm = 81.3729019
+W name = 'module._orig_mod.blocks.4.attn.c_k.weight' | median_sv = 2.2458541 | spectral_norm = 7.1846342 | frobenius_norm = 81.6591110
+W name = 'module._orig_mod.blocks.4.attn.c_v.weight' | median_sv = 2.3352342 | spectral_norm = 8.5638704 | frobenius_norm = 91.5932999
+W name = 'module._orig_mod.blocks.4.attn.c_proj.weight' | median_sv = 2.7030110 | spectral_norm = 6.8100615 | frobenius_norm = 92.1460342
+W name = 'module._orig_mod.blocks.4.mlp.c_fc.weight' | median_sv = 6.4980030 | spectral_norm = 13.2420225 | frobenius_norm = 190.6252289
+W name = 'module._orig_mod.blocks.4.mlp.c_proj.weight' | median_sv = 3.0933364 | spectral_norm = 7.7274361 | frobenius_norm = 93.7688828
+W name = 'module._orig_mod.blocks.5.attn.c_q.weight' | median_sv = 2.3097081 | spectral_norm = 7.6220636 | frobenius_norm = 81.9719696
+W name = 'module._orig_mod.blocks.5.attn.c_k.weight' | median_sv = 2.3046336 | spectral_norm = 7.3305855 | frobenius_norm = 81.4361343
+W name = 'module._orig_mod.blocks.5.attn.c_v.weight' | median_sv = 2.3888481 | spectral_norm = 8.7100611 | frobenius_norm = 91.2852707
+W name = 'module._orig_mod.blocks.5.attn.c_proj.weight' | median_sv = 2.6508248 | spectral_norm = 6.7716904 | frobenius_norm = 90.3016129
+W name = 'module._orig_mod.blocks.5.mlp.c_fc.weight' | median_sv = 6.5472698 | spectral_norm = 13.1936941 | frobenius_norm = 191.9390411
+W name = 'module._orig_mod.blocks.5.mlp.c_proj.weight' | median_sv = 3.1263416 | spectral_norm = 7.4303894 | frobenius_norm = 94.3645706
+W name = 'module._orig_mod.blocks.6.attn.c_q.weight' | median_sv = 2.3395734 | spectral_norm = 7.3699627 | frobenius_norm = 82.7902832
+W name = 'module._orig_mod.blocks.6.attn.c_k.weight' | median_sv = 2.3424227 | spectral_norm = 7.0373163 | frobenius_norm = 82.3056107
+W name = 'module._orig_mod.blocks.6.attn.c_v.weight' | median_sv = 2.3667705 | spectral_norm = 8.9717560 | frobenius_norm = 92.7231140
+W name = 'module._orig_mod.blocks.6.attn.c_proj.weight' | median_sv = 2.6896145 | spectral_norm = 6.6869111 | frobenius_norm = 90.7078323
+W name = 'module._orig_mod.blocks.6.mlp.c_fc.weight' | median_sv = 6.4743466 | spectral_norm = 14.0474100 | frobenius_norm = 190.5644226
+W name = 'module._orig_mod.blocks.6.mlp.c_proj.weight' | median_sv = 3.1049047 | spectral_norm = 7.9410176 | frobenius_norm = 94.1067886
+W name = 'module._orig_mod.blocks.7.attn.c_q.weight' | median_sv = 2.3668335 | spectral_norm = 7.9381618 | frobenius_norm = 83.1177063
+W name = 'module._orig_mod.blocks.7.attn.c_k.weight' | median_sv = 2.3632174 | spectral_norm = 7.1960964 | frobenius_norm = 82.8185196
+W name = 'module._orig_mod.blocks.7.attn.c_v.weight' | median_sv = 2.2760434 | spectral_norm = 8.3782930 | frobenius_norm = 89.9817047
+W name = 'module._orig_mod.blocks.7.attn.c_proj.weight' | median_sv = 2.6596480 | spectral_norm = 6.8265562 | frobenius_norm = 91.0636139
+W name = 'module._orig_mod.blocks.7.mlp.c_fc.weight' | median_sv = 6.5496235 | spectral_norm = 14.1127434 | frobenius_norm = 193.2351074
+W name = 'module._orig_mod.blocks.7.mlp.c_proj.weight' | median_sv = 3.1398726 | spectral_norm = 8.0194855 | frobenius_norm = 94.8972549
+W name = 'module._orig_mod.blocks.8.attn.c_q.weight' | median_sv = 2.3523707 | spectral_norm = 7.2540584 | frobenius_norm = 83.9581680
+W name = 'module._orig_mod.blocks.8.attn.c_k.weight' | median_sv = 2.3171175 | spectral_norm = 7.5138583 | frobenius_norm = 83.0855408
+W name = 'module._orig_mod.blocks.8.attn.c_v.weight' | median_sv = 2.3669946 | spectral_norm = 9.8373032 | frobenius_norm = 92.2743607
+W name = 'module._orig_mod.blocks.8.attn.c_proj.weight' | median_sv = 2.7387049 | spectral_norm = 6.7896361 | frobenius_norm = 91.1207047
+W name = 'module._orig_mod.blocks.8.mlp.c_fc.weight' | median_sv = 6.5290084 | spectral_norm = 14.4301519 | frobenius_norm = 193.0360260
+W name = 'module._orig_mod.blocks.8.mlp.c_proj.weight' | median_sv = 3.1379757 | spectral_norm = 8.1469498 | frobenius_norm = 94.7077866
+W name = 'module._orig_mod.blocks.9.attn.c_q.weight' | median_sv = 2.4372017 | spectral_norm = 7.4783158 | frobenius_norm = 86.0919952
+W name = 'module._orig_mod.blocks.9.attn.c_k.weight' | median_sv = 2.3983781 | spectral_norm = 8.0665474 | frobenius_norm = 85.4171295
+W name = 'module._orig_mod.blocks.9.attn.c_v.weight' | median_sv = 2.4529812 | spectral_norm = 8.4610195 | frobenius_norm = 91.8843994
+W name = 'module._orig_mod.blocks.9.attn.c_proj.weight' | median_sv = 2.7950947 | spectral_norm = 6.3738246 | frobenius_norm = 92.4142838
+W name = 'module._orig_mod.blocks.9.mlp.c_fc.weight' | median_sv = 6.5424333 | spectral_norm = 13.8192835 | frobenius_norm = 193.2634888
+W name = 'module._orig_mod.blocks.9.mlp.c_proj.weight' | median_sv = 3.1589868 | spectral_norm = 8.5533180 | frobenius_norm = 94.7003174
+W name = 'module._orig_mod.blocks.10.attn.c_q.weight' | median_sv = 2.1548157 | spectral_norm = 8.4818954 | frobenius_norm = 82.0110397
+W name = 'module._orig_mod.blocks.10.attn.c_k.weight' | median_sv = 2.0627110 | spectral_norm = 8.1249123 | frobenius_norm = 81.5800095
+W name = 'module._orig_mod.blocks.10.attn.c_v.weight' | median_sv = 2.3100872 | spectral_norm = 8.3386402 | frobenius_norm = 87.4837723
+W name = 'module._orig_mod.blocks.10.attn.c_proj.weight' | median_sv = 2.8938489 | spectral_norm = 6.6677432 | frobenius_norm = 97.2883148
+W name = 'module._orig_mod.blocks.10.mlp.c_fc.weight' | median_sv = 6.6294146 | spectral_norm = 13.2626133 | frobenius_norm = 193.5114594
+W name = 'module._orig_mod.blocks.10.mlp.c_proj.weight' | median_sv = 3.0517073 | spectral_norm = 8.9404640 | frobenius_norm = 91.4133530
+W name = 'module._orig_mod.blocks.11.attn.c_q.weight' | median_sv = 2.3565579 | spectral_norm = 8.3316536 | frobenius_norm = 84.8760986
+W name = 'module._orig_mod.blocks.11.attn.c_k.weight' | median_sv = 2.2719228 | spectral_norm = 8.4096661 | frobenius_norm = 83.0668793
+W name = 'module._orig_mod.blocks.11.attn.c_v.weight' | median_sv = 2.2349191 | spectral_norm = 8.4174242 | frobenius_norm = 84.4726028
+W name = 'module._orig_mod.blocks.11.attn.c_proj.weight' | median_sv = 2.8284202 | spectral_norm = 6.7603717 | frobenius_norm = 95.8339615
+W name = 'module._orig_mod.blocks.11.mlp.c_fc.weight' | median_sv = 6.6628261 | spectral_norm = 15.2837534 | frobenius_norm = 195.1171875
+W name = 'module._orig_mod.blocks.11.mlp.c_proj.weight' | median_sv = 3.0647283 | spectral_norm = 9.0229673 | frobenius_norm = 92.5111008
+W name = 'module._orig_mod.value_embeds.weight' | l1_to_l2_norm = 244.3684082
+W name = 'module._orig_mod.lm_head.weight' | median_sv = 20.9798737 | spectral_norm = 162.0505829 | frobenius_norm = 703.1802368
+===========================================
+============== Gradient norms: ==============
+G name = 'module._orig_mod.embed.weight' | l1_to_l2_norm = 0.0000002
+G name = 'module._orig_mod.blocks.0.attn.c_q.weight' | median_sv = 0.0000155 | spectral_norm = 0.0007456 | frobenius_norm = 0.0015623 | spectral_norm_est_t2 = 0.0008310 | spectral_norm_est_t4 = 0.0007537
+G name = 'module._orig_mod.blocks.0.attn.c_k.weight' | median_sv = 0.0000153 | spectral_norm = 0.0006657 | frobenius_norm = 0.0015704 | spectral_norm_est_t2 = 0.0007988 | spectral_norm_est_t4 = 0.0006839
+G name = 'module._orig_mod.blocks.0.attn.c_v.weight' | median_sv = 0.0000132 | spectral_norm = 0.0055223 | frobenius_norm = 0.0059041 | spectral_norm_est_t2 = 0.0055284 | spectral_norm_est_t4 = 0.0055219
+G name = 'module._orig_mod.blocks.0.attn.c_proj.weight' | median_sv = 0.0000325 | spectral_norm = 0.0129748 | frobenius_norm = 0.0134057 | spectral_norm_est_t2 = 0.0129765 | spectral_norm_est_t4 = 0.0129752
+G name = 'module._orig_mod.blocks.0.mlp.c_fc.weight' | median_sv = 0.0000542 | spectral_norm = 0.0059319 | frobenius_norm = 0.0065865 | spectral_norm_est_t2 = 0.0059338 | spectral_norm_est_t4 = 0.0059319
+G name = 'module._orig_mod.blocks.0.mlp.c_proj.weight' | median_sv = 0.0000913 | spectral_norm = 0.0042094 | frobenius_norm = 0.0060844 | spectral_norm_est_t2 = 0.0042254 | spectral_norm_est_t4 = 0.0042094
+G name = 'module._orig_mod.blocks.1.attn.c_q.weight' | median_sv = 0.0000076 | spectral_norm = 0.0020175 | frobenius_norm = 0.0022057 | spectral_norm_est_t2 = 0.0020187 | spectral_norm_est_t4 = 0.0020175
+G name = 'module._orig_mod.blocks.1.attn.c_k.weight' | median_sv = 0.0000085 | spectral_norm = 0.0014336 | frobenius_norm = 0.0018111 | spectral_norm_est_t2 = 0.0014436 | spectral_norm_est_t4 = 0.0014336
+G name = 'module._orig_mod.blocks.1.attn.c_v.weight' | median_sv = 0.0000172 | spectral_norm = 0.0150225 | frobenius_norm = 0.0152736 | spectral_norm_est_t2 = 0.0150230 | spectral_norm_est_t4 = 0.0150224
+G name = 'module._orig_mod.blocks.1.attn.c_proj.weight' | median_sv = 0.0000299 | spectral_norm = 0.0072213 | frobenius_norm = 0.0082435 | spectral_norm_est_t2 = 0.0072329 | spectral_norm_est_t4 = 0.0072213
+G name = 'module._orig_mod.blocks.1.mlp.c_fc.weight' | median_sv = 0.0000400 | spectral_norm = 0.0045736 | frobenius_norm = 0.0053392 | spectral_norm_est_t2 = 0.0045789 | spectral_norm_est_t4 = 0.0045747
+G name = 'module._orig_mod.blocks.1.mlp.c_proj.weight' | median_sv = 0.0000757 | spectral_norm = 0.0039567 | frobenius_norm = 0.0061590 | spectral_norm_est_t2 = 0.0041659 | spectral_norm_est_t4 = 0.0039788
+G name = 'module._orig_mod.blocks.2.attn.c_q.weight' | median_sv = 0.0000133 | spectral_norm = 0.0038482 | frobenius_norm = 0.0042577 | spectral_norm_est_t2 = 0.0038511 | spectral_norm_est_t4 = 0.0038481
+G name = 'module._orig_mod.blocks.2.attn.c_k.weight' | median_sv = 0.0000141 | spectral_norm = 0.0017494 | frobenius_norm = 0.0029690 | spectral_norm_est_t2 = 0.0019473 | spectral_norm_est_t4 = 0.0017846
+G name = 'module._orig_mod.blocks.2.attn.c_v.weight' | median_sv = 0.0000135 | spectral_norm = 0.0137752 | frobenius_norm = 0.0139671 | spectral_norm_est_t2 = 0.0137757 | spectral_norm_est_t4 = 0.0137755
+G name = 'module._orig_mod.blocks.2.attn.c_proj.weight' | median_sv = 0.0000324 | spectral_norm = 0.0059613 | frobenius_norm = 0.0069239 | spectral_norm_est_t2 = 0.0059761 | spectral_norm_est_t4 = 0.0059611
+G name = 'module._orig_mod.blocks.2.mlp.c_fc.weight' | median_sv = 0.0000486 | spectral_norm = 0.0062760 | frobenius_norm = 0.0072003 | spectral_norm_est_t2 = 0.0062846 | spectral_norm_est_t4 = 0.0062775
+G name = 'module._orig_mod.blocks.2.mlp.c_proj.weight' | median_sv = 0.0000918 | spectral_norm = 0.0056083 | frobenius_norm = 0.0079010 | spectral_norm_est_t2 = 0.0056588 | spectral_norm_est_t4 = 0.0056088
+G name = 'module._orig_mod.blocks.3.attn.c_q.weight' | median_sv = 0.0000098 | spectral_norm = 0.0025804 | frobenius_norm = 0.0028494 | spectral_norm_est_t2 = 0.0025820 | spectral_norm_est_t4 = 0.0025804
+G name = 'module._orig_mod.blocks.3.attn.c_k.weight' | median_sv = 0.0000108 | spectral_norm = 0.0014744 | frobenius_norm = 0.0022378 | spectral_norm_est_t2 = 0.0015544 | spectral_norm_est_t4 = 0.0014800
+G name = 'module._orig_mod.blocks.3.attn.c_v.weight' | median_sv = 0.0000166 | spectral_norm = 0.0158525 | frobenius_norm = 0.0161832 | spectral_norm_est_t2 = 0.0158536 | spectral_norm_est_t4 = 0.0158526
+G name = 'module._orig_mod.blocks.3.attn.c_proj.weight' | median_sv = 0.0000270 | spectral_norm = 0.0053797 | frobenius_norm = 0.0064369 | spectral_norm_est_t2 = 0.0053925 | spectral_norm_est_t4 = 0.0053797
+G name = 'module._orig_mod.blocks.3.mlp.c_fc.weight' | median_sv = 0.0000438 | spectral_norm = 0.0059507 | frobenius_norm = 0.0068920 | spectral_norm_est_t2 = 0.0059581 | spectral_norm_est_t4 = 0.0059512
+G name = 'module._orig_mod.blocks.3.mlp.c_proj.weight' | median_sv = 0.0000825 | spectral_norm = 0.0057974 | frobenius_norm = 0.0077144 | spectral_norm_est_t2 = 0.0058282 | spectral_norm_est_t4 = 0.0057981
+G name = 'module._orig_mod.blocks.4.attn.c_q.weight' | median_sv = 0.0000129 | spectral_norm = 0.0021229 | frobenius_norm = 0.0026104 | spectral_norm_est_t2 = 0.0021298 | spectral_norm_est_t4 = 0.0021228
+G name = 'module._orig_mod.blocks.4.attn.c_k.weight' | median_sv = 0.0000142 | spectral_norm = 0.0014960 | frobenius_norm = 0.0026519 | spectral_norm_est_t2 = 0.0016602 | spectral_norm_est_t4 = 0.0015174
+G name = 'module._orig_mod.blocks.4.attn.c_v.weight' | median_sv = 0.0000144 | spectral_norm = 0.0131612 | frobenius_norm = 0.0134369 | spectral_norm_est_t2 = 0.0131617 | spectral_norm_est_t4 = 0.0131612
+G name = 'module._orig_mod.blocks.4.attn.c_proj.weight' | median_sv = 0.0000261 | spectral_norm = 0.0055559 | frobenius_norm = 0.0064957 | spectral_norm_est_t2 = 0.0055676 | spectral_norm_est_t4 = 0.0055560
+G name = 'module._orig_mod.blocks.4.mlp.c_fc.weight' | median_sv = 0.0000436 | spectral_norm = 0.0065054 | frobenius_norm = 0.0074843 | spectral_norm_est_t2 = 0.0065143 | spectral_norm_est_t4 = 0.0065059
+G name = 'module._orig_mod.blocks.4.mlp.c_proj.weight' | median_sv = 0.0000820 | spectral_norm = 0.0058539 | frobenius_norm = 0.0078637 | spectral_norm_est_t2 = 0.0058944 | spectral_norm_est_t4 = 0.0058548
+G name = 'module._orig_mod.blocks.5.attn.c_q.weight' | median_sv = 0.0000103 | spectral_norm = 0.0020742 | frobenius_norm = 0.0023846 | spectral_norm_est_t2 = 0.0020772 | spectral_norm_est_t4 = 0.0020743
+G name = 'module._orig_mod.blocks.5.attn.c_k.weight' | median_sv = 0.0000111 | spectral_norm = 0.0013120 | frobenius_norm = 0.0022524 | spectral_norm_est_t2 = 0.0014497 | spectral_norm_est_t4 = 0.0013311
+G name = 'module._orig_mod.blocks.5.attn.c_v.weight' | median_sv = 0.0000141 | spectral_norm = 0.0118872 | frobenius_norm = 0.0122722 | spectral_norm_est_t2 = 0.0118889 | spectral_norm_est_t4 = 0.0118869
+G name = 'module._orig_mod.blocks.5.attn.c_proj.weight' | median_sv = 0.0000217 | spectral_norm = 0.0054362 | frobenius_norm = 0.0062919 | spectral_norm_est_t2 = 0.0054464 | spectral_norm_est_t4 = 0.0054363
+G name = 'module._orig_mod.blocks.5.mlp.c_fc.weight' | median_sv = 0.0000374 | spectral_norm = 0.0056661 | frobenius_norm = 0.0065101 | spectral_norm_est_t2 = 0.0056720 | spectral_norm_est_t4 = 0.0056663
+G name = 'module._orig_mod.blocks.5.mlp.c_proj.weight' | median_sv = 0.0000732 | spectral_norm = 0.0046481 | frobenius_norm = 0.0064394 | spectral_norm_est_t2 = 0.0046840 | spectral_norm_est_t4 = 0.0046485
+G name = 'module._orig_mod.blocks.6.attn.c_q.weight' | median_sv = 0.0000099 | spectral_norm = 0.0023350 | frobenius_norm = 0.0026056 | spectral_norm_est_t2 = 0.0023371 | spectral_norm_est_t4 = 0.0023349
+G name = 'module._orig_mod.blocks.6.attn.c_k.weight' | median_sv = 0.0000104 | spectral_norm = 0.0013338 | frobenius_norm = 0.0023298 | spectral_norm_est_t2 = 0.0015391 | spectral_norm_est_t4 = 0.0013903
+G name = 'module._orig_mod.blocks.6.attn.c_v.weight' | median_sv = 0.0000076 | spectral_norm = 0.0078157 | frobenius_norm = 0.0079854 | spectral_norm_est_t2 = 0.0078164 | spectral_norm_est_t4 = 0.0078158
+G name = 'module._orig_mod.blocks.6.attn.c_proj.weight' | median_sv = 0.0000206 | spectral_norm = 0.0040959 | frobenius_norm = 0.0046647 | spectral_norm_est_t2 = 0.0041024 | spectral_norm_est_t4 = 0.0040957
+G name = 'module._orig_mod.blocks.6.mlp.c_fc.weight' | median_sv = 0.0000352 | spectral_norm = 0.0049337 | frobenius_norm = 0.0056806 | spectral_norm_est_t2 = 0.0049397 | spectral_norm_est_t4 = 0.0049338
+G name = 'module._orig_mod.blocks.6.mlp.c_proj.weight' | median_sv = 0.0000692 | spectral_norm = 0.0042874 | frobenius_norm = 0.0060208 | spectral_norm_est_t2 = 0.0043391 | spectral_norm_est_t4 = 0.0042884
+G name = 'module._orig_mod.blocks.7.attn.c_q.weight' | median_sv = 0.0000086 | spectral_norm = 0.0018470 | frobenius_norm = 0.0021155 | spectral_norm_est_t2 = 0.0018493 | spectral_norm_est_t4 = 0.0018469
+G name = 'module._orig_mod.blocks.7.attn.c_k.weight' | median_sv = 0.0000090 | spectral_norm = 0.0009568 | frobenius_norm = 0.0017704 | spectral_norm_est_t2 = 0.0011327 | spectral_norm_est_t4 = 0.0010178
+G name = 'module._orig_mod.blocks.7.attn.c_v.weight' | median_sv = 0.0000118 | spectral_norm = 0.0105542 | frobenius_norm = 0.0108317 | spectral_norm_est_t2 = 0.0105554 | spectral_norm_est_t4 = 0.0105544
+G name = 'module._orig_mod.blocks.7.attn.c_proj.weight' | median_sv = 0.0000223 | spectral_norm = 0.0058629 | frobenius_norm = 0.0064661 | spectral_norm_est_t2 = 0.0058671 | spectral_norm_est_t4 = 0.0058629
+G name = 'module._orig_mod.blocks.7.mlp.c_fc.weight' | median_sv = 0.0000339 | spectral_norm = 0.0047086 | frobenius_norm = 0.0054221 | spectral_norm_est_t2 = 0.0047139 | spectral_norm_est_t4 = 0.0047087
+G name = 'module._orig_mod.blocks.7.mlp.c_proj.weight' | median_sv = 0.0000697 | spectral_norm = 0.0040856 | frobenius_norm = 0.0057180 | spectral_norm_est_t2 = 0.0041300 | spectral_norm_est_t4 = 0.0040865
+G name = 'module._orig_mod.blocks.8.attn.c_q.weight' | median_sv = 0.0000124 | spectral_norm = 0.0029586 | frobenius_norm = 0.0033079 | spectral_norm_est_t2 = 0.0029619 | spectral_norm_est_t4 = 0.0029585
+G name = 'module._orig_mod.blocks.8.attn.c_k.weight' | median_sv = 0.0000132 | spectral_norm = 0.0019698 | frobenius_norm = 0.0030699 | spectral_norm_est_t2 = 0.0021710 | spectral_norm_est_t4 = 0.0020119
+G name = 'module._orig_mod.blocks.8.attn.c_v.weight' | median_sv = 0.0000058 | spectral_norm = 0.0054910 | frobenius_norm = 0.0056102 | spectral_norm_est_t2 = 0.0054914 | spectral_norm_est_t4 = 0.0054911
+G name = 'module._orig_mod.blocks.8.attn.c_proj.weight' | median_sv = 0.0000305 | spectral_norm = 0.0070108 | frobenius_norm = 0.0074170 | spectral_norm_est_t2 = 0.0070118 | spectral_norm_est_t4 = 0.0070107
+G name = 'module._orig_mod.blocks.8.mlp.c_fc.weight' | median_sv = 0.0000375 | spectral_norm = 0.0050992 | frobenius_norm = 0.0057791 | spectral_norm_est_t2 = 0.0051032 | spectral_norm_est_t4 = 0.0050993
+G name = 'module._orig_mod.blocks.8.mlp.c_proj.weight' | median_sv = 0.0000762 | spectral_norm = 0.0044146 | frobenius_norm = 0.0061293 | spectral_norm_est_t2 = 0.0044566 | spectral_norm_est_t4 = 0.0044153
+G name = 'module._orig_mod.blocks.9.attn.c_q.weight' | median_sv = 0.0000111 | spectral_norm = 0.0021426 | frobenius_norm = 0.0024273 | spectral_norm_est_t2 = 0.0021449 | spectral_norm_est_t4 = 0.0021427
+G name = 'module._orig_mod.blocks.9.attn.c_k.weight' | median_sv = 0.0000116 | spectral_norm = 0.0013789 | frobenius_norm = 0.0021094 | spectral_norm_est_t2 = 0.0014706 | spectral_norm_est_t4 = 0.0013899
+G name = 'module._orig_mod.blocks.9.attn.c_v.weight' | median_sv = 0.0000046 | spectral_norm = 0.0041763 | frobenius_norm = 0.0042499 | spectral_norm_est_t2 = 0.0041766 | spectral_norm_est_t4 = 0.0041764
+G name = 'module._orig_mod.blocks.9.attn.c_proj.weight' | median_sv = 0.0000365 | spectral_norm = 0.0093734 | frobenius_norm = 0.0096227 | spectral_norm_est_t2 = 0.0093738 | spectral_norm_est_t4 = 0.0093737
+G name = 'module._orig_mod.blocks.9.mlp.c_fc.weight' | median_sv = 0.0000397 | spectral_norm = 0.0054961 | frobenius_norm = 0.0061096 | spectral_norm_est_t2 = 0.0054990 | spectral_norm_est_t4 = 0.0054959
+G name = 'module._orig_mod.blocks.9.mlp.c_proj.weight' | median_sv = 0.0000768 | spectral_norm = 0.0046388 | frobenius_norm = 0.0064142 | spectral_norm_est_t2 = 0.0046934 | spectral_norm_est_t4 = 0.0046398
+G name = 'module._orig_mod.blocks.10.attn.c_q.weight' | median_sv = 0.0000203 | spectral_norm = 0.0060413 | frobenius_norm = 0.0065184 | spectral_norm_est_t2 = 0.0060443 | spectral_norm_est_t4 = 0.0060411
+G name = 'module._orig_mod.blocks.10.attn.c_k.weight' | median_sv = 0.0000231 | spectral_norm = 0.0030203 | frobenius_norm = 0.0049572 | spectral_norm_est_t2 = 0.0035048 | spectral_norm_est_t4 = 0.0031973
+G name = 'module._orig_mod.blocks.10.attn.c_v.weight' | median_sv = 0.0000058 | spectral_norm = 0.0068176 | frobenius_norm = 0.0069294 | spectral_norm_est_t2 = 0.0068181 | spectral_norm_est_t4 = 0.0068177
+G name = 'module._orig_mod.blocks.10.attn.c_proj.weight' | median_sv = 0.0000479 | spectral_norm = 0.0321728 | frobenius_norm = 0.0323582 | spectral_norm_est_t2 = 0.0321743 | spectral_norm_est_t4 = 0.0321742
+G name = 'module._orig_mod.blocks.10.mlp.c_fc.weight' | median_sv = 0.0000504 | spectral_norm = 0.0109485 | frobenius_norm = 0.0114789 | spectral_norm_est_t2 = 0.0109499 | spectral_norm_est_t4 = 0.0109483
+G name = 'module._orig_mod.blocks.10.mlp.c_proj.weight' | median_sv = 0.0000914 | spectral_norm = 0.0081783 | frobenius_norm = 0.0103248 | spectral_norm_est_t2 = 0.0082483 | spectral_norm_est_t4 = 0.0081796
+G name = 'module._orig_mod.blocks.11.attn.c_q.weight' | median_sv = 0.0000168 | spectral_norm = 0.0061033 | frobenius_norm = 0.0064075 | spectral_norm_est_t2 = 0.0061060 | spectral_norm_est_t4 = 0.0061031
+G name = 'module._orig_mod.blocks.11.attn.c_k.weight' | median_sv = 0.0000179 | spectral_norm = 0.0024412 | frobenius_norm = 0.0034674 | spectral_norm_est_t2 = 0.0025914 | spectral_norm_est_t4 = 0.0024599
+G name = 'module._orig_mod.blocks.11.attn.c_v.weight' | median_sv = 0.0000071 | spectral_norm = 0.0093056 | frobenius_norm = 0.0093941 | spectral_norm_est_t2 = 0.0093062 | spectral_norm_est_t4 = 0.0093060
+G name = 'module._orig_mod.blocks.11.attn.c_proj.weight' | median_sv = 0.0000413 | spectral_norm = 0.0373422 | frobenius_norm = 0.0375605 | spectral_norm_est_t2 = 0.0373441 | spectral_norm_est_t4 = 0.0373438
+G name = 'module._orig_mod.blocks.11.mlp.c_fc.weight' | median_sv = 0.0000580 | spectral_norm = 0.0203378 | frobenius_norm = 0.0209543 | spectral_norm_est_t2 = 0.0203407 | spectral_norm_est_t4 = 0.0203375
+G name = 'module._orig_mod.blocks.11.mlp.c_proj.weight' | median_sv = 0.0001070 | spectral_norm = 0.0156617 | frobenius_norm = 0.0182136 | spectral_norm_est_t2 = 0.0157209 | spectral_norm_est_t4 = 0.0156642
+G name = 'module._orig_mod.value_embeds.weight' | l1_to_l2_norm = 0.0000003
+G name = 'module._orig_mod.lm_head.weight' | median_sv = 0.0003060 | spectral_norm = 0.2283062 | frobenius_norm = 0.2306666 | spectral_norm_est_t2 = 0.2283131 | spectral_norm_est_t4 = 0.2283078
+saved grads to logs/1ef9fb63-cc79-4219-bbf9-a03b83709afa/grad_state_step000375.pt
+===========================================
+step:376/1480 train_time:104964ms step_avg:286.79ms
+step:377/1480 train_time:105251ms step_avg:286.79ms
+step:378/1480 train_time:105551ms step_avg:286.82ms
+step:379/1480 train_time:105850ms step_avg:286.86ms
+step:380/1480 train_time:106148ms step_avg:286.89ms
+step:381/1480 train_time:106449ms step_avg:286.92ms
+step:382/1480 train_time:106749ms step_avg:286.96ms
+step:383/1480 train_time:107048ms step_avg:286.99ms
+step:384/1480 train_time:107347ms step_avg:287.02ms
+step:385/1480 train_time:107646ms step_avg:287.06ms
+step:386/1480 train_time:107944ms step_avg:287.09ms
+step:387/1480 train_time:108243ms step_avg:287.12ms
+step:388/1480 train_time:108542ms step_avg:287.15ms
+step:389/1480 train_time:108839ms step_avg:287.17ms
+step:390/1480 train_time:109137ms step_avg:287.20ms
+step:391/1480 train_time:109437ms step_avg:287.23ms
+step:392/1480 train_time:109737ms step_avg:287.27ms
+step:393/1480 train_time:110036ms step_avg:287.30ms
+step:394/1480 train_time:110336ms step_avg:287.33ms
+step:395/1480 train_time:110635ms step_avg:287.36ms
+step:396/1480 train_time:110936ms step_avg:287.40ms
+step:397/1480 train_time:111238ms step_avg:287.44ms
+step:398/1480 train_time:111537ms step_avg:287.47ms
+step:399/1480 train_time:111836ms step_avg:287.50ms
+step:400/1480 train_time:112136ms step_avg:287.53ms
+step:401/1480 train_time:112437ms step_avg:287.56ms
+step:402/1480 train_time:112737ms step_avg:287.59ms
+step:403/1480 train_time:113037ms step_avg:287.63ms
+step:404/1480 train_time:113336ms step_avg:287.66ms
+step:405/1480 train_time:113636ms step_avg:287.68ms
+step:406/1480 train_time:113935ms step_avg:287.72ms
+step:407/1480 train_time:114235ms step_avg:287.75ms
+step:408/1480 train_time:114536ms step_avg:287.78ms
+step:409/1480 train_time:114835ms step_avg:287.81ms
+step:410/1480 train_time:115136ms step_avg:287.84ms
+step:411/1480 train_time:115436ms step_avg:287.87ms
+step:412/1480 train_time:115735ms step_avg:287.90ms
+step:413/1480 train_time:116035ms step_avg:287.93ms
+step:414/1480 train_time:116336ms step_avg:287.96ms
+step:415/1480 train_time:116636ms step_avg:287.99ms
+step:416/1480 train_time:116936ms step_avg:288.02ms
+step:417/1480 train_time:117236ms step_avg:288.05ms
+step:418/1480 train_time:117537ms step_avg:288.08ms
+step:419/1480 train_time:117837ms step_avg:288.11ms
+step:420/1480 train_time:118138ms step_avg:288.14ms
+step:421/1480 train_time:118436ms step_avg:288.17ms
+step:422/1480 train_time:118736ms step_avg:288.19ms
+step:423/1480 train_time:119037ms step_avg:288.23ms
+step:424/1480 train_time:119338ms step_avg:288.26ms
+step:425/1480 train_time:119637ms step_avg:288.28ms
+step:426/1480 train_time:119937ms step_avg:288.31ms
+step:427/1480 train_time:120238ms step_avg:288.34ms
+step:428/1480 train_time:120538ms step_avg:288.37ms
+step:429/1480 train_time:120837ms step_avg:288.39ms
+step:430/1480 train_time:121139ms step_avg:288.43ms
+step:431/1480 train_time:121439ms step_avg:288.45ms
+step:432/1480 train_time:121738ms step_avg:288.48ms
+step:433/1480 train_time:122037ms step_avg:288.50ms
+step:434/1480 train_time:122337ms step_avg:288.53ms
