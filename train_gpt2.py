@@ -623,14 +623,15 @@ for step in range(args.num_iterations + 1):
                 continue
             if p.grad is None:
                 continue
-            log[name] = p.grad.detach()
             if "embed" in name:
                 l1_to_l2_norm = torch.norm(p.grad.float(), p=2, dim=1).mean().item()
                 print0(f"G {name = } | {l1_to_l2_norm = :.7f}")
             else:
                 frobenius_norm = torch.linalg.norm(p.grad.float(), ord='fro').item()
                 spectral_norm = torch.linalg.matrix_norm(p.grad.float(), ord=2).item()
-                median_sv = torch.median(p.grad.float().svd(compute_uv=False).S).item() + 1e-8
+                S = p.grad.float().svd(compute_uv=False).S
+                log[name] = S
+                median_sv = torch.median(S).item() + 1e-8
                 gram1 = p.grad.float() if p.size(0) <= p.size(1) else p.grad.float().T
                 gram2 = gram1 @ gram1.T
                 frobenius_norm2 = torch.linalg.norm(gram2, ord='fro').item()
