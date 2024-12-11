@@ -16,6 +16,7 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from liger_kernel.ops.cross_entropy import LigerCrossEntropyFunction
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -303,9 +304,12 @@ class GPT(nn.Module):
 
         x = norm(x)
         logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
-        logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        loss = LigerCrossEntropyFunction.apply(
+            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=50256, softcap=30.0
+        )
+        # logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        # logits = logits.float()
+        # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return loss
 
 # -----------------------------------------------------------------------------
