@@ -16,13 +16,51 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-from liger_kernel.ops.cross_entropy import LigerCrossEntropyFunction
-from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
+
+
+class LigerFusedLinearCrossEntropyLoss(torch.nn.Module):
+    def __init__(
+        self,
+        ignore_index: int = -100,
+        lse_square_scale: float = 0.0,
+        label_smoothing: float = 0.0,
+        reduction: str = "mean",
+        softcap: float | None = None,
+    ):
+        super().__init__()
+        assert (label_smoothing >= 0) and (
+            label_smoothing <= 1
+        ), f"label_smoothing must be between 0.0 and 1.0. Got: {label_smoothing}"
+        assert reduction in {
+            "mean",
+            "sum",
+            "none",
+        }, f"reduction must be one of 'mean', 'sum', or 'none'. Got: {reduction}"
+        assert (
+            softcap is None or softcap > 0
+        ), f"softcap must greater than 0.0 or None. Got: {softcap}"
+        self.ignore_index = ignore_index
+        self.lse_square_scale = lse_square_scale
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+        self.softcap = softcap
+
+    def forward(self, lin_weight, _input, target, bias=None):
+        return LigerFusedLinearCrossEntropyFunction.apply(
+            _input,
+            lin_weight,
+            target,
+            bias,
+            self.ignore_index,
+            self.lse_square_scale,
+            self.label_smoothing,
+            self.reduction,
+            self.softcap,
+        )
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
-
-torch._dynamo.config.capture_scalar_outputs = True
 
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
@@ -304,8 +342,8 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, vi[self.num_encoder_layers-1-i], x0, block_mask)
 
         x = norm(x)
-        loss_fn = LigerFusedLinearCrossEntropyLoss()
-        loss = loss_fn(self.lm_head.weight, x, targets, softcap=30.0, ignore_index=50256)
+        loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=50256, softcap=30.0)
+        loss = loss_fn(self.lm_head.weight, x, targets)
         # logits = self.lm_head(x)
         # logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         # logits = logits.float()
