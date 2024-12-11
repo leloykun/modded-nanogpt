@@ -304,7 +304,7 @@ class GPT(nn.Module):
 
         x = norm(x)
         logits = self.lm_head(x)
-        loss = LigerCrossEntropyFunction.apply(
+        loss, z_loss = LigerCrossEntropyFunction.apply(
             logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=50256, softcap=30.0
         )
         # logits = 30 * torch.tanh(logits / 30) # @Grad62304977
