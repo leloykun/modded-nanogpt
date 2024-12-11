@@ -36,15 +36,10 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
-    A = X @ X.T
-    a_norm = A.norm()
-    A /= a_norm + eps
-    B = b * A + c * A @ A
-    X /= a_norm**0.5 + eps
-    X = a * X + B @ X
-    for _ in range(steps - 1):
+    for _ in range(steps):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
@@ -576,12 +571,17 @@ for step in range(args.num_iterations + 1):
         for p in model.parameters():
             p.grad /= train_accumulation_steps
     if args.log_norms and master_process and step != 0 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
         print0("============== Gradient norms: ==============")
+        log = dict()
         for name, p in model.named_parameters():
             if p.ndim != 2:
                 continue
             if p.grad is None:
                 continue
+            log[name] = p.grad.detach()
             if "embed" in name:
                 l1_to_l2_norm = torch.norm(p.grad.float(), p=2, dim=1).mean().item()
                 print0(f"G {name = } | {l1_to_l2_norm = :.5f}")
@@ -598,7 +598,11 @@ for step in range(args.num_iterations + 1):
                 spectral_norm_est_t4 = frobenius_norm4 ** (0.25)
                 print0(f"G {name = } | {median_sv = :.7f} | {spectral_norm = :.5f} | {frobenius_norm = :.7f} | {spectral_norm_est_t2 = :.7f} | {spectral_norm_est_t4 = :.7f}")
                 print0(f"- {name = } | {median_sv/spectral_norm = :.7f} | {median_sv/frobenius_norm = :.7f} | {median_sv/spectral_norm_est_t2 = :.7f} | {median_sv/spectral_norm_est_t4 = :.7f}")
+        torch.save(log, "logs/%s/grad_state_step%06d.pt" % (run_id, step))
         print0("===========================================")
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
     # momentum warmup for Muon
     frac = min(step/300, 1)
     for group in optimizer3.param_groups:
