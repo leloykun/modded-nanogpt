@@ -282,12 +282,13 @@ class GPT(nn.Module):
         BLOCK_SIZE = 128
         assert inputs.ndim == 1
         docs = (inputs == 50256).cumsum(0)
+        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+
         if patch_train:
             BLOCK_SIZE = BLOCK_SIZE // self.patch_size
             sliding_window_num_blocks = torch.ceil(sliding_window_num_blocks // self.patch_size)
             docs = docs[::self.patch_size]
-        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
-        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
 
         def document_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
