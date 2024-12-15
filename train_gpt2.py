@@ -247,6 +247,7 @@ class GPTConfig:
     num_layers : int = 12
     num_heads : int = 6 # head dim 128 suggested by @Grad62304977
     model_dim : int = 768
+    patch_size: int = 4
 
 class GPT(nn.Module):
 
@@ -268,15 +269,23 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
+        self.patch_size = config.patch_size # PatchTrain, @kabachuha
+        self.vocab_size = config.vocab_size
+
     def forward(
         self,
         inputs: torch.Tensor,
         targets: torch.Tensor,
         sliding_window_num_blocks: torch.Tensor,
+        patch_train: bool = False,
     ):
         BLOCK_SIZE = 128
         assert inputs.ndim == 1
         docs = (inputs == 50256).cumsum(0)
+        if patch_train:
+            BLOCK_SIZE = BLOCK_SIZE // self.patch_size
+            sliding_window_num_blocks = torch.ceil(sliding_window_num_blocks // self.patch_size)
+            docs = docs[::self.patch_size]
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
         docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
 
@@ -316,10 +325,14 @@ class GPT(nn.Module):
         block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
 
         # forward the GPT model itself
-        x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
+        x: torch.Tensor = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
+        if patch_train:
+            x = x.view(x.shape[0], -1, self.patch_size, x.shape[-1]).mean(2)
         x = norm(x) # @Grad62304977
         x0 = x
-        ve = self.value_embeds(inputs)
+        ve: list[torch.Tensor] = self.value_embeds(inputs)
+        if patch_train:
+            ve = [vex.view(-1, self.patch_size, vex.shape[-1]).mean(1) for vex in ve]
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
 
         # Store outputs for U-Net skip connections
@@ -338,7 +351,16 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        if patch_train:
+            shift_logits = logits[..., :-1, :].reshape(-1, self.vocab_size)
+            shift_labels = targets[..., self.patch_size:].reshape(-1, self.patch_size)
+            loss = 0
+            log_probs = F.log_softmax(shift_logits, dim=1)
+            for i in range(self.patch_size):
+                loss = loss + F.nll_loss(log_probs, shift_labels[:, i])
+            loss = loss / self.patch_size
+        else:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return loss
 
 # -----------------------------------------------------------------------------
@@ -417,6 +439,8 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+
+    patch_train_training_amount: float = 0.67 # when the transformer trains on token patches instead of tokens. Patching is disabled on validation for fair comparison
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -523,6 +547,7 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 for step in range(args.num_iterations + 1):
+    patch_train = step < int(args.patch_train_training_amount * args.num_iterations)
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
@@ -551,7 +576,7 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 inputs_val, targets_val = val_loader.next_batch()
-                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
+                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks, False)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
@@ -588,7 +613,7 @@ for step in range(args.num_iterations + 1):
                 stack.enter_context(model.no_sync())
             if step >= 5:
                 stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-            model(inputs_train, targets_train, sliding_window_num_blocks).backward()
+            model(inputs_train, targets_train, sliding_window_num_blocks, patch_train).backward()
             inputs_train, targets_train = train_loader.next_batch()
     if train_accumulation_steps != 1:
         for p in model.parameters():
