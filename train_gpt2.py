@@ -171,7 +171,7 @@ class Rotary(torch.nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim: int, num_heads: int):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -182,6 +182,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.c_k.weight.data.copy_(self.c_q.weight.data) # init W_q*W_k^T to be ~diagonal suggested by @RavnaBergsndot
 
     def forward(self, x, vi, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
