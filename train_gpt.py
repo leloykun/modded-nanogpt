@@ -388,7 +388,7 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
-    max_device_batch_size = 64*1024 # batch size per device in tokens
+    max_device_batch_size = 96*1024 # batch size per device in tokens
     save_checkpoint = False
 args = Hyperparameters()
 
