@@ -458,7 +458,13 @@ optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.6),
                                dict(params=head_params, lr=0.008),
                                dict(params=scalar_params, lr=0.04)],
                               betas=(0.8, 0.95), fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95)
+# optimizer2 = Muon(hidden_matrix_params, lr=0.5, momentum=0.95)
+# optimizer2 = Muon(hidden_matrix_params, lr=0.25, momentum=0.95)
+optimizer2 = Muon(hidden_matrix_params, lr=0.1, momentum=0.95)
+# optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95)  # done
+# optimizer2 = Muon(hidden_matrix_params, lr=0.01, momentum=0.95)
+# optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95)
+# optimizer2 = Muon(hidden_matrix_params, lr=0.005, momentum=0.95)
 optimizers = [optimizer1, optimizer2]
 
 # learning rate schedule: stable then decay
