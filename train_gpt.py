@@ -508,7 +508,7 @@ for step in range(train_steps + 1):
         val_loader.reset()
         val_loss = 0.0
         # calculate the number of steps to take in the val loop.
-        val_batch_size = world_size * micro_bs
+        val_batch_size = world_size * 64 * 1024
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
         for _ in range(val_steps):
