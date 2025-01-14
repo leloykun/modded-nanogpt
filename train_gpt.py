@@ -462,8 +462,8 @@ optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.6),
 # optimizer2 = Muon(hidden_matrix_params, lr=0.25, momentum=0.95)  # done
 # optimizer2 = Muon(hidden_matrix_params, lr=0.1, momentum=0.95)  # done
 # optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95)  # done
-optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95)
-# optimizer2 = Muon(hidden_matrix_params, lr=0.01, momentum=0.95)
+# optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95)  # done
+optimizer2 = Muon(hidden_matrix_params, lr=0.01, momentum=0.95)
 # optimizer2 = Muon(hidden_matrix_params, lr=0.005, momentum=0.95)
 optimizers = [optimizer1, optimizer2]
 
