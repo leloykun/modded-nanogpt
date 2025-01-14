@@ -48,6 +48,7 @@ def zeropower_via_newtonschulz5(G, steps):
     
     if G.size(0) > G.size(1):
         X = X.T
+    X = torch.einsum("ij,ij,ab->ab", G.type_as(X), X, X)
     return X
 
 class Muon(torch.optim.Optimizer):
