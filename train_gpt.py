@@ -268,12 +268,13 @@ class GPT(nn.Module):
             document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & document_mask
 
-        def dense_to_ordered(dense_mask):
+        def dense_to_ordered(dense_mask: torch.Tensor):
             num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
+            indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+            # indices = (~dense_mask).argsort(dim=-1, descending=False, stable=True).to(torch.int32)
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
-        def create_doc_swc_block_mask(sliding_window_num_blocks):
+        def create_doc_swc_block_masks(sliding_window_num_blocks: int):
             kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device='cuda')
             q_idx = block_idx[:, None]
             causal_bm = q_idx >= kv_idx
@@ -287,16 +288,28 @@ class GPT(nn.Module):
             full_bm  = causal_full_bm & window_full_bm & document_full_bm
             kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm & ~full_bm)
             full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
-            return BlockMask.from_kv_blocks(
-                kv_num_blocks,
-                kv_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_causal,
+            short_sliding_window_num_blocks = sliding_window_num_blocks // 2
+            return (
+                BlockMask.from_kv_blocks(
+                    kv_num_blocks,
+                    kv_indices,
+                    full_kv_num_blocks,
+                    full_kv_indices,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    mask_mod=document_causal,
+                ),
+                BlockMask.from_kv_blocks(
+                    torch.clamp_max(kv_num_blocks, torch.clamp_min(short_sliding_window_num_blocks - full_kv_num_blocks, 1)),
+                    kv_indices,
+                    torch.clamp_max(full_kv_num_blocks, short_sliding_window_num_blocks - 1),
+                    full_kv_indices,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    mask_mod=document_causal,
+                ),
             )
 
-        block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
+        # Long-short SWA block masks by @leloykun & @YouJiacheng
+        long_swa_block_mask, short_swa_block_mask = create_doc_swc_block_masks(sliding_window_num_blocks)
 
         x0 = norm(self.embed(inputs[None]).bfloat16()) # use of norm here by @Grad62304977
         x = x0
@@ -307,13 +320,16 @@ class GPT(nn.Module):
         # Store outputs for U-Net skip connections
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
+        is_long_block_mask = [True, False, False, False, True, False]
         for i in range(self.num_encoder_layers):
+            block_mask = long_swa_block_mask if is_long_block_mask[i] else short_swa_block_mask
             x = self.blocks[i](x, ve_enc[i], x0, block_mask)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
+        is_long_block_mask = list(reversed(is_long_block_mask))
         for i in range(self.num_decoder_layers):
+            block_mask = long_swa_block_mask if is_long_block_mask[i] else short_swa_block_mask
             x = x + self.skip_weights[i] * skip_connections.pop()
-            # U-net structure on token value embeddings by @leloykun
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
 
         x = norm(x)
@@ -382,7 +398,7 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
-    num_iterations = 1390 # number of iterations to run
+    num_iterations = 1405 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     bf16_embeds = True
     # evaluation and logging
