@@ -255,7 +255,7 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -266,7 +266,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
-        self.attn_scale = nn.Parameter(torch.tensor(1.0 / (dim // num_heads) ** 0.5))
+        self.attn_scale = 0.13 + 0.01 * min(layer_idx, 11 - layer_idx)  # unet pattern attention scale by @leloykun
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -280,7 +280,7 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2) * self.attn_scale, k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=1.)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -302,7 +302,7 @@ class Block(nn.Module):
     def __init__(self, model_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(model_dim, num_heads) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(model_dim, num_heads, layer_idx) if layer_idx != 7 else None
         self.mlp = MLP(model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
