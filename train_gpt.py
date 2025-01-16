@@ -271,7 +271,6 @@ class GPT(nn.Module):
         def dense_to_ordered(dense_mask: torch.Tensor):
             num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
             indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
-            # indices = (~dense_mask).argsort(dim=-1, descending=False, stable=True).to(torch.int32)
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
         def create_doc_swc_block_masks(sliding_window_num_blocks: int):
