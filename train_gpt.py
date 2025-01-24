@@ -518,18 +518,18 @@ def train(args: Hyperparameters):
     batch_size = world_size * args.seq_len
     train_loader = distributed_data_generator(args.train_files, batch_size, rank, world_size)
 
-    model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=args.seq_len).cuda()
-    for m in model.modules():
+    raw_model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=args.seq_len).cuda()
+    for m in raw_model.modules():
         if isinstance(m, nn.Embedding):
             m.bfloat16()
-    for param in model.parameters():
+    for param in raw_model.parameters():
         dist.broadcast(param.detach(), 0)
 
     # collect the parameters to optimize
-    hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
-    embed_params = [model.embed.weight, *model.value_embeds.parameters()]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
+    hidden_matrix_params = [p for p in raw_model.blocks.parameters() if p.ndim >= 2]
+    embed_params = [raw_model.embed.weight, *raw_model.value_embeds.parameters()]
+    scalar_params = [p for p in raw_model.parameters() if p.ndim < 2]
+    head_params = [raw_model.lm_head.weight]
 
     # init the optimizer(s)
     adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
@@ -550,7 +550,20 @@ def train(args: Hyperparameters):
     def sw_num_blks(window_size: int):
         return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
-    model: nn.Module = torch.compile(model)
+    model_32: nn.Module = torch.compile(raw_model, dynamic=False)
+    args.seq_len = 32 * 1024
+    for _ in range(12):
+        inputs, targets = next(train_loader)
+        print(inputs.shape, targets.shape)
+        model_32(inputs, targets, sw_num_blks(128))
+
+    model_64: nn.Module = torch.compile(raw_model, dynamic=False)
+    args.seq_len = 64 * 1024
+    for _ in range(12):
+        inputs, targets = next(train_loader)
+        print(inputs.shape, targets.shape)
+        model_64(inputs, targets, sw_num_blks(128))
+
     training_time_ms = 0
     # start the clock
     torch.cuda.synchronize()
@@ -559,9 +572,9 @@ def train(args: Hyperparameters):
     train_steps = args.num_iterations
     for step in range(train_steps + 1):
         if step < 500:
-            args.seq_len = 32 * 1024
+            model = model_32
         else:
-            args.seq_len = 64 * 1024
+            model = model_64
 
         last_step = (step == train_steps)
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
@@ -580,7 +593,7 @@ def train(args: Hyperparameters):
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
-            model.eval()
+            model_64.eval()
             val_bs = world_size * args.val_seq_len
             assert args.val_tokens % val_bs == 0
             val_steps = args.val_tokens // val_bs
@@ -589,12 +602,12 @@ def train(args: Hyperparameters):
             with torch.no_grad():
                 for _ in range(val_steps):
                     x, y = next(val_loader)
-                    val_loss += model(x, y, sw_num_blks(window_size))
+                    val_loss += model_64(x, y, sw_num_blks(window_size))
             val_loss /= val_steps
             del val_loader
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
-            model.train()
+            model_64.train()
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
