@@ -69,7 +69,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
         grad_w = torch._scaled_mm(
             x_f8.t().contiguous(),
             grad_f8.t().contiguous().t(),
-            out_dtype=torch.bfloat16,
+            out_dtype=torch.float32,
             scale_a=x_inv_s,
             scale_b=grad_inv_s,
             use_fast_accum=False,
@@ -80,7 +80,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
 
 @mm_backward_op.register_fake
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.to(torch.bfloat16)
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
 
 def backward(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
@@ -517,7 +517,10 @@ def train(args: Hyperparameters):
     # load data
     train_loader = distributed_data_generator(args.train_files, args.batch_size, rank, world_size)
 
-    model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=args.seq_len).cuda().bfloat16()
+    model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=args.seq_len).cuda()
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            m.bfloat16()
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
 
