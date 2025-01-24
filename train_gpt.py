@@ -551,15 +551,10 @@ def train(args: Hyperparameters):
     def sw_num_blks(window_size: int):
         return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
-    model_32: nn.Module = torch.compile(raw_model, dynamic=False)
+    model: nn.Module = torch.compile(raw_model, dynamic=False)
     for _ in range(24):
-        inputs, targets = torch.randint(0, vocab_size, (32 * 1024,), device="cuda"), torch.randint(0, 50257, (32 * 1024,), device="cuda")
-        model_32(inputs, targets, sw_num_blks(128))
-
-    model_64: nn.Module = torch.compile(raw_model, dynamic=False)
-    for _ in range(24):
-        inputs, targets = torch.randint(0, vocab_size, (64 * 1024,), device="cuda"), torch.randint(0, 50257, (64 * 1024,), device="cuda")
-        model_64(inputs, targets, sw_num_blks(128))
+        inputs, targets = torch.randint(0, vocab_size, (args.seq_len,), device="cuda"), torch.randint(0, vocab_size, (args.seq_len,), device="cuda")
+        model(inputs, targets, sw_num_blks(128))
 
     training_time_ms = 0
     # start the clock
@@ -568,13 +563,6 @@ def train(args: Hyperparameters):
     # begin training
     train_steps = args.num_iterations
     for step in range(train_steps + 1):
-        if step < 500:
-            args.seq_len = 32 * 1024
-            model = model_32
-        else:
-            args.seq_len = 64 * 1024
-            model = model_64
-
         last_step = (step == train_steps)
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
         # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
@@ -592,7 +580,7 @@ def train(args: Hyperparameters):
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
-            model_64.eval()
+            model.eval()
             val_bs = world_size * args.val_seq_len
             assert args.val_tokens % val_bs == 0
             val_steps = args.val_tokens // val_bs
@@ -601,12 +589,12 @@ def train(args: Hyperparameters):
             with torch.no_grad():
                 for _ in range(val_steps):
                     x, y = next(val_loader)
-                    val_loss += model_64(x, y, sw_num_blks(window_size))
+                    val_loss += model(x, y, sw_num_blks(window_size))
             val_loss /= val_steps
             del val_loader
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
-            model_64.train()
+            model.train()
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.perf_counter()
