@@ -99,9 +99,9 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 
 mm_op.register_autograd(backward, setup_context=setup_context)
 
-def lm_head_fp8(x: Tensor, w: Tensor) -> Tensor:
+def lm_head_fp8(x: Tensor, w: Tensor, x_s: float=2.0, w_s: float=2.0**5, grad_s: float=2.0**29) -> Tensor:
     _x = x.flatten(0, -2)
-    out: Tensor = torch.ops.nanogpt.mm(_x, w, x_s=2.0, w_s=32.0, grad_s=2.0**29)[0]
+    out: Tensor = torch.ops.nanogpt.mm(_x, w, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
     return out.reshape(*x.shape[:-1], -1)
 
 # -----------------------------------------------------------------------------
@@ -604,9 +604,7 @@ def train(args: Hyperparameters):
         # --------------- TRAINING SECTION BEGIN -----------------
         inputs, targets = next(train_loader)
         for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
-            loss = model(input_seq, target_seq, sw_num_blks(window_size))
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss.backward()
+            model(input_seq, target_seq, sw_num_blks(window_size)).backward()
         for param in model.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
         # momentum warmup for Muon
