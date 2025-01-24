@@ -237,10 +237,10 @@ class CustomLinearFunction(torch.autograd.Function):
         grad_input = grad_weight = None
 
         if ctx.needs_input_grad[0]: # Gradient w.r.t input
-            grad_input = torch.bmm(grad_output, weight) # Perform matmul in bfloat16
+            grad_input = grad_output @ weight # Perform matmul in bfloat16
 
         if ctx.needs_input_grad[1]: # Gradient w.r.t weight
-            grad_weight = torch.bmm(input.T, grad_output) # Perform matmul in bfloat16
+            grad_weight = input.T @ grad_output # Perform matmul in bfloat16
 
         # grad_weight should be returned with the original weight dtype (float32)
         # grad_input should be returned with the original input dtype (bfloat16)
