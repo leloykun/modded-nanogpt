@@ -273,8 +273,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(dim // num_heads, max_seq_len)
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
-        self.q_norm = nn.LayerNorm(dim // num_heads)
-        self.k_norm = nn.LayerNorm(dim // num_heads)
+        self.attn_scale = 0.12
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -284,9 +283,9 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
-        q, k = self.q_norm(q), self.k_norm(k) # QK norm @Grad62304977
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -307,8 +306,8 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, model_dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
         super().__init__()
-        # skip attention of blocks.12 (the 13th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(model_dim, num_heads, max_seq_len) if layer_idx != 12 else None
+        # skip attention of blocks.11 (the 12th layer) by @YouJiacheng
+        self.attn = CausalSelfAttention(model_dim, num_heads, max_seq_len) if layer_idx != 11 else None
         self.mlp = MLP(model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
@@ -329,7 +328,7 @@ class ValueEmbedding(nn.Module):
     def forward(self, x: Tensor) -> list[Tensor | None]:
         ve = [emb(x) for emb in self.embed]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 2 * self.num_embeddings) + [ve[0], ve[1], ve[2]]
+        ve = ve + [None] * (self.num_layers - 2 * self.num_embeddings) + ve
         return ve
 
 # -----------------------------------------------------------------------------
