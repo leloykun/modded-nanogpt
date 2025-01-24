@@ -295,7 +295,7 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.c_fc = CastedLinear(dim, 4 * dim, use_fp8=True, x_scale=2.0, w_scale=2.0, grad_scale=2.0**11)
+        self.c_fc = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
