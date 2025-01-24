@@ -230,18 +230,14 @@ class CustomLinearFunction(torch.autograd.Function):
         input, weight = ctx.saved_tensors
 
         # Cast everything to bfloat16 for backward calculations
-        grad_output = grad_output.bfloat16()
-        input = input.bfloat16()
-        weight = weight.bfloat16()
+        # grad_output = grad_output.bfloat16()
+        # input = input.bfloat16()
+        # weight = weight.bfloat16()
 
-        grad_input = grad_weight = None
-        # assert False, f"{grad_output.shape} | {weight.shape} | {input.shape}"
+        assert False, f"{grad_output.dtype} | {weight.dtype} | {input.dtype}"
 
-        if ctx.needs_input_grad[0]: # Gradient w.r.t input
-            grad_input = grad_output @ weight # Perform matmul in bfloat16
-
-        if ctx.needs_input_grad[1]: # Gradient w.r.t weight
-            grad_weight = torch.einsum('bso,bsi->oi', grad_output, input) # Perform matmul in bfloat16
+        grad_input = grad_output @ weight # Perform matmul in bfloat16
+        grad_weight = torch.einsum('bso,bsi->oi', grad_output, input) # Perform matmul in bfloat16
 
         # grad_weight should be returned with the original weight dtype (float32)
         # grad_input should be returned with the original input dtype (bfloat16)
