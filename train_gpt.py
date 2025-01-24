@@ -396,7 +396,7 @@ class GPT(nn.Module):
                     BLOCK_SIZE=BLOCK_SIZE,
                     mask_mod=document_causal,
                 )
-            return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks.clamp_max(8))
+            return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks.clamp_max(4))
 
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         long_bm, short_bm = create_doc_swc_block_masks(sliding_window_num_blocks)
