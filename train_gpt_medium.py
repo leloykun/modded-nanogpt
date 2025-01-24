@@ -517,7 +517,7 @@ def train(args: Hyperparameters):
     batch_size = world_size * args.seq_len
     train_loader = distributed_data_generator(args.train_files, batch_size, rank, world_size)
 
-    model = GPT(vocab_size=50257, num_layers=16, num_heads=6, model_dim=1024, max_seq_len=args.seq_len).cuda()
+    model = GPT(vocab_size=50257, num_layers=16, num_heads=8, model_dim=1024, max_seq_len=args.seq_len).cuda()
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.bfloat16()
