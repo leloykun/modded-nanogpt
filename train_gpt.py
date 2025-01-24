@@ -99,11 +99,6 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 
 mm_op.register_autograd(backward, setup_context=setup_context)
 
-def lm_head_fp8(x: Tensor, w: Tensor, x_s: float=2.0, w_s: float=2.0**5, grad_s: float=2.0**29) -> Tensor:
-    _x = x.flatten(0, -2)
-    out: Tensor = torch.ops.nanogpt.mm(_x, w, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
-    return out.reshape(*x.shape[:-1], -1)
-
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -236,8 +231,13 @@ class CastedLinear(nn.Linear):
         with torch.no_grad():
             self.weight.uniform_(-bound, bound)
 
-    def forward(self, x):
-        return F.linear(x, self.weight.type_as(x))
+    def forward(self, x: Tensor):
+        if self.use_fp8 and self.training:
+            _x = x.flatten(0, -2)
+            out: Tensor = torch.ops.nanogpt.mm(_x, w, x_s=self.x_scale, w_s=self.w_scale, grad_s=self.grad_scale)[0]
+            return out.reshape(*x.shape[:-1], -1)
+        else:
+            return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -421,7 +421,7 @@ class GPT(nn.Module):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
         x = norm(x)
-        logits = lm_head_fp8(x, self.lm_head.weight) if self.training else self.lm_head(x)
+        logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
@@ -604,7 +604,9 @@ def train(args: Hyperparameters):
         # --------------- TRAINING SECTION BEGIN -----------------
         inputs, targets = next(train_loader)
         for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
-            model(input_seq, target_seq, sw_num_blks(window_size)).backward()
+            loss = model(input_seq, target_seq, sw_num_blks(window_size))
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss.backward()
         for param in model.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
         # momentum warmup for Muon
