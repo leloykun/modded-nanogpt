@@ -305,10 +305,10 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, model_dim: int, num_heads: int, max_seq_len: int):
+    def __init__(self, model_dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
         super().__init__()
-        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(model_dim, num_heads, max_seq_len)
+        # skip attention of blocks.12 (the 13th layer) by @YouJiacheng
+        self.attn = CausalSelfAttention(model_dim, num_heads, max_seq_len) if layer_idx != 12 else None
         self.mlp = MLP(model_dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
@@ -344,7 +344,7 @@ class GPT(nn.Module):
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)])
         # U-net design by @brendanh0gan
         self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
