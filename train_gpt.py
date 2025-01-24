@@ -558,11 +558,7 @@ def train(args: Hyperparameters):
     # begin training
     train_steps = args.num_iterations
     for step in range(train_steps + 1):
-        if step == 0:
-            args.seq_len = 32 * 1024
-        elif step == 1:
-            args.seq_len = 64 * 1024
-        elif step < 500:
+        if step < 500:
             args.seq_len = 32 * 1024
         else:
             args.seq_len = 64 * 1024
