@@ -69,7 +69,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
         grad_w = torch._scaled_mm(
             x_f8.t().contiguous(),
             grad_f8.t().contiguous().t(),
-            out_dtype=torch.bfloat16,
+            out_dtype=torch.float32,
             scale_a=x_inv_s,
             scale_b=grad_inv_s,
             use_fast_accum=False,
@@ -80,7 +80,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
 
 @mm_backward_op.register_fake
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.to(torch.bfloat16)
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
 
 def backward(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
@@ -295,7 +295,7 @@ class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.c_fc = CastedLinear(dim, 4 * dim)
-        self.c_proj = CastedLinear(4 * dim, dim)
+        self.c_proj = CastedLinear(4 * dim, dim, use_fp8=True, x_scale=2.0, w_scale=2.0**5, grad_scale=2.0**29)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
@@ -604,9 +604,7 @@ def train(args: Hyperparameters):
         # --------------- TRAINING SECTION BEGIN -----------------
         inputs, targets = next(train_loader)
         for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
-            loss = model(input_seq, target_seq, sw_num_blks(window_size))
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss.backward()
+            model(input_seq, target_seq, sw_num_blks(window_size)).backward()
         for param in model.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
         # momentum warmup for Muon
