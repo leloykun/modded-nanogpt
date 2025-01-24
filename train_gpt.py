@@ -518,6 +518,7 @@ def train(args: Hyperparameters):
     batch_size = world_size * args.seq_len
     train_loader = distributed_data_generator(args.train_files, batch_size, rank, world_size)
 
+    vocab_size = 50257
     raw_model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=args.seq_len).cuda()
     for m in raw_model.modules():
         if isinstance(m, nn.Embedding):
@@ -551,17 +552,13 @@ def train(args: Hyperparameters):
         return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
     model_32: nn.Module = torch.compile(raw_model, dynamic=False)
-    args.seq_len = 32 * 1024
-    for _ in range(12):
-        inputs, targets = next(train_loader)
-        print(inputs.shape, targets.shape)
+    for _ in range(24):
+        inputs, targets = torch.randint(0, vocab_size, (32 * 1024,), device="cuda"), torch.randint(0, 50257, (32 * 1024,), device="cuda")
         model_32(inputs, targets, sw_num_blks(128))
 
     model_64: nn.Module = torch.compile(raw_model, dynamic=False)
-    args.seq_len = 64 * 1024
-    for _ in range(12):
-        inputs, targets = next(train_loader)
-        print(inputs.shape, targets.shape)
+    for _ in range(24):
+        inputs, targets = torch.randint(0, vocab_size, (64 * 1024,), device="cuda"), torch.randint(0, 50257, (64 * 1024,), device="cuda")
         model_64(inputs, targets, sw_num_blks(128))
 
     training_time_ms = 0
@@ -572,8 +569,10 @@ def train(args: Hyperparameters):
     train_steps = args.num_iterations
     for step in range(train_steps + 1):
         if step < 500:
+            args.seq_len = 32 * 1024
             model = model_32
         else:
+            args.seq_len = 64 * 1024
             model = model_64
 
         last_step = (step == train_steps)
