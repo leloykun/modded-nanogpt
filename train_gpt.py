@@ -235,6 +235,7 @@ class CustomLinearFunction(torch.autograd.Function):
         weight = weight.bfloat16()
 
         grad_input = grad_weight = None
+        assert False, f"{grad_output.shape} | {weight.shape} | {input.shape}"
 
         if ctx.needs_input_grad[0]: # Gradient w.r.t input
             grad_input = grad_output @ weight # Perform matmul in bfloat16
