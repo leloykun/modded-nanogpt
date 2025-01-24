@@ -217,9 +217,39 @@ class Muon(torch.optim.Optimizer):
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
+class CustomLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input: Tensor, weight: Tensor):
+        # Cast weight to input dtype for forward pass consistency (though technically not needed for correctness here)
+        output = F.linear(input, weight.type_as(input))
+        ctx.save_for_backward(input, weight) # Save both original weight and input for backward
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        input, weight = ctx.saved_tensors
+
+        # Cast everything to bfloat16 for backward calculations
+        grad_output = grad_output.bfloat16()
+        input = input.bfloat16()
+        weight = weight.bfloat16()
+
+        grad_input = grad_weight = None
+
+        if ctx.needs_input_grad[0]: # Gradient w.r.t input
+            grad_input = grad_output @ weight # Perform matmul in bfloat16
+
+        if ctx.needs_input_grad[1]: # Gradient w.r.t weight
+            grad_weight = grad_output.T @ input # Perform matmul in bfloat16
+
+        # grad_weight should be returned with the original weight dtype (float32)
+        # grad_input should be returned with the original input dtype (bfloat16)
+        return grad_input, grad_weight.float() # Cast grad_weight back to float32
+
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8: bool = False, x_scale: float = 1.0, w_scale: float = 1.0, grad_scale: float = 1.0):
         super().__init__(in_features, out_features, bias=False)
+        self.custom_linear = CustomLinearFunction.apply # Store the custom function
         self.use_fp8 = use_fp8
         self.x_scale = x_scale
         self.w_scale = w_scale
@@ -237,7 +267,7 @@ class CastedLinear(nn.Linear):
             out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_scale, w_s=self.w_scale, grad_s=self.grad_scale)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
-            return F.linear(x, self.weight.type_as(x))
+            return self.custom_linear(x, self.weight) # Use the custom linear function
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
