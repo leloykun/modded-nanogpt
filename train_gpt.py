@@ -552,9 +552,12 @@ def train(args: Hyperparameters):
         return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
     model: nn.Module = torch.compile(raw_model, dynamic=False)
+
+    print("Warming up model...")
     for _ in range(24):
         inputs, targets = torch.randint(0, vocab_size, (args.seq_len,), device="cuda"), torch.randint(0, vocab_size, (args.seq_len,), device="cuda")
         model(inputs, targets, sw_num_blks(128))
+    print("Finished warming up model.")
 
     training_time_ms = 0
     # start the clock
