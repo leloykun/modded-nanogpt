@@ -518,19 +518,18 @@ def train(args: Hyperparameters):
     batch_size = world_size * args.seq_len
     train_loader = distributed_data_generator(args.train_files, batch_size, rank, world_size)
 
-    vocab_size = 50257
-    raw_model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=args.seq_len).cuda()
-    for m in raw_model.modules():
+    model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=args.seq_len).cuda()
+    for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.bfloat16()
-    for param in raw_model.parameters():
+    for param in model.parameters():
         dist.broadcast(param.detach(), 0)
 
     # collect the parameters to optimize
-    hidden_matrix_params = [p for p in raw_model.blocks.parameters() if p.ndim >= 2]
-    embed_params = [raw_model.embed.weight, *raw_model.value_embeds.parameters()]
-    scalar_params = [p for p in raw_model.parameters() if p.ndim < 2]
-    head_params = [raw_model.lm_head.weight]
+    hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
+    embed_params = [model.embed.weight, *model.value_embeds.parameters()]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    head_params = [model.lm_head.weight]
 
     # init the optimizer(s)
     adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
@@ -551,13 +550,7 @@ def train(args: Hyperparameters):
     def sw_num_blks(window_size: int):
         return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
-    model: nn.Module = torch.compile(raw_model, dynamic=False)
-
-    print("Warming up model...")
-    for _ in range(24):
-        inputs, targets = torch.randint(0, vocab_size, (args.seq_len,), device="cuda"), torch.randint(0, vocab_size, (args.seq_len,), device="cuda")
-        model(inputs, targets, sw_num_blks(128))
-    print("Finished warming up model.")
+    model: nn.Module = torch.compile(model, dynamic=False)
 
     training_time_ms = 0
     # start the clock
