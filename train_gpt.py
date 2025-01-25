@@ -617,8 +617,8 @@ def train(args: Hyperparameters):
                 if param.grad is not None:
                     grad_max_abs = param.grad.abs().max().item()
                     weight_max_abs = param.abs().max().item()
-                    grad_scale = np.ceil(np.log2(0.8 * 448.0 / grad_max_abs))
-                    weight_scale = np.ceil(np.log2(0.8 * 40896.0 / weight_max_abs))
+                    grad_scale = np.ceil(np.log2(0.8 * 448.0 / grad_max_abs)) if grad_max_abs > 1e-9 else 1
+                    weight_scale = np.ceil(np.log2(0.8 * 40896.0 / weight_max_abs)) if weight_max_abs > 1e-9 else 1
                     print0(f"{name:<40} | grad_scale={grad_scale:<3} | weight_scale={weight_scale:<3}", console=True)
         # momentum warmup for Muon
         frac = min(step / 300, 1)
