@@ -296,8 +296,8 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.c_fc = CastedLinear(dim, 4 * dim, use_fp8=True, x_scale=2.0, w_scale=2.0**8, grad_scale=2.0**20)
-        self.c_proj = CastedLinear(4 * dim, dim, use_fp8=True, x_scale=2.0, w_scale=2.0**6, grad_scale=2.0**23)
+        self.c_fc = CastedLinear(dim, 4 * dim, use_fp8=False, x_scale=2.0, w_scale=2.0**8, grad_scale=2.0**20)
+        self.c_proj = CastedLinear(4 * dim, dim, use_fp8=False, x_scale=2.0, w_scale=2.0**6, grad_scale=2.0**23)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
@@ -354,7 +354,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_scale=2.0, w_scale=2.0**8, grad_scale=2.0**19)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=False, x_scale=2.0, w_scale=2.0**8, grad_scale=2.0**19)
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
@@ -614,7 +614,7 @@ def train(args: Hyperparameters):
             model(input_seq, target_seq, sw_num_blks(window_size)).backward()
         for param in model.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        if False and master_process and step % 25 == 0:
+        if master_process and (step+5) % 25 == 0:
             for name, param in model.named_parameters():
                 if not ("c_proj" in name or "c_fc" in name or "lm_head" in name):
                     continue
@@ -626,7 +626,7 @@ def train(args: Hyperparameters):
                     if step > 0:
                         param_name_to_grad_scale_map[name] = min(param_name_to_grad_scale_map[name], grad_scale)
                         param_name_to_weight_scale_map[name] = min(param_name_to_weight_scale_map[name], weight_scale)
-                    print0(f"{name:<40} | grad_scale={grad_scale:<3} | weight_scale={weight_scale:<3}", console=True)
+                    print0(f"{name:<40} | weight_scale={weight_scale:<3} | grad_scale={grad_scale:<3}", console=True)
         # momentum warmup for Muon
         frac = min(step / 300, 1)
         for group in optimizer2.param_groups:
@@ -641,10 +641,11 @@ def train(args: Hyperparameters):
         approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
         print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
     if master_process:
-        for name, grad_scale in param_name_to_grad_scale_map.items():
-            print0(f"{name:<40} | grad_scale={grad_scale:<3}", console=True)
-        for name, weight_scale in param_name_to_weight_scale_map.items():
-            print0(f"{name:<40} | weight_scale={weight_scale:<3}", console=True)
+        param_names = list(param_name_to_grad_scale_map.keys())
+        for name in param_names:
+            grad_scale = param_name_to_grad_scale_map[name]
+            weight_scale = param_name_to_weight_scale_map[name]
+            print0(f"{name:<40} | weight_scale={weight_scale:<3} | grad_scale={grad_scale:<3}", console=True)
 
     print0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
