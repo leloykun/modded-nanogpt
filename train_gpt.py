@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import numpy as np
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -616,8 +617,9 @@ def train(args: Hyperparameters):
                 if param.grad is not None:
                     grad_max_abs = param.grad.abs().max().item()
                     weight_max_abs = param.abs().max().item()
-                    # print in scientific notation to avoid overflow
-                    print0(f"{name:<20} grad_max_abs: {grad_max_abs:.4e} weight_max_abs:{weight_max_abs:.4e}", console=True)
+                    grad_scale = np.ceil(np.log2(0.8 * 448.0 / grad_max_abs))
+                    weight_scale = np.ceil(np.log2(0.8 * 40896.0 / weight_max_abs))
+                    print0(f"{name:<40} | grad_scale={grad_scale:<3} | weight_scale={weight_scale:<3}", console=True)
         # momentum warmup for Muon
         frac = min(step / 300, 1)
         for group in optimizer2.param_groups:
