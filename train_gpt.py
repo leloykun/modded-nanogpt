@@ -609,8 +609,10 @@ def train(args: Hyperparameters):
             model(input_seq, target_seq, sw_num_blks(window_size)).backward()
         for param in model.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        if master_process:
+        if master_process and step % 25 == 0:
             for name, param in model.named_parameters():
+                if not ("c_proj" in name or "c_fc" in name or "lm_head" in name):
+                    continue
                 if param.grad is not None:
                     grad_max_abs = param.grad.abs().max().item()
                     weight_max_abs = param.abs().max().item()
