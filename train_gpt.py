@@ -272,7 +272,7 @@ class CausalSelfAttention(nn.Module):
         self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads, max_seq_len)
-        self.c_proj = CastedLinear(dim, dim)
+        self.c_proj = CastedLinear(dim, dim, use_fp8=True, x_scale=2.0, w_scale=2.0**8, grad_scale=2.0**25)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
@@ -296,8 +296,8 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.c_fc = CastedLinear(dim, 4 * dim, use_fp8=False, x_scale=2.0, w_scale=2.0**8, grad_scale=2.0**23)
-        self.c_proj = CastedLinear(4 * dim, dim)
+        self.c_fc = CastedLinear(dim, 4 * dim, use_fp8=True, x_scale=2.0, w_scale=2.0**8, grad_scale=2.0**20)
+        self.c_proj = CastedLinear(4 * dim, dim, use_fp8=True, x_scale=2.0, w_scale=2.0**6, grad_scale=2.0**23)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
@@ -354,7 +354,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=False, x_scale=2.0, w_scale=2.0**8, grad_scale=2.0**19)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_scale=2.0, w_scale=2.0**8, grad_scale=2.0**19)
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
@@ -614,7 +614,7 @@ def train(args: Hyperparameters):
             model(input_seq, target_seq, sw_num_blks(window_size)).backward()
         for param in model.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        if master_process and step % 25 == 0:
+        if False and master_process and step % 25 == 0:
             for name, param in model.named_parameters():
                 if not ("c_proj" in name or "c_fc" in name or "lm_head" in name):
                     continue
