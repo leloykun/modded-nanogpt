@@ -609,6 +609,13 @@ def train(args: Hyperparameters):
             model(input_seq, target_seq, sw_num_blks(window_size)).backward()
         for param in model.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        if master_process:
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_max_abs = param.grad.abs().max().item()
+                    weight_max_abs = param.abs().max().item()
+                    # print in scientific notation to avoid overflow
+                    print0(f"{name:<20} grad_max_abs: {grad_max_abs:.4e} weight_max_abs:{weight_max_abs:.4e}")
         # momentum warmup for Muon
         frac = min(step / 300, 1)
         for group in optimizer2.param_groups:
