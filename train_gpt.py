@@ -272,7 +272,7 @@ class CausalSelfAttention(nn.Module):
         self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads, max_seq_len)
-        self.c_proj = CastedLinear(dim, dim, use_fp8=True, x_scale=2.0, w_scale=2.0**8, grad_scale=2.0**25)
+        self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
