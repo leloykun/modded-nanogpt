@@ -19,7 +19,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 
 # -----------------------------------------------------------------------------
-# Custom operators : FP8 matmul for lm_head by @YouJiacheng
+# Custom operators : FP8 matmul by @YouJiacheng
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
@@ -82,7 +82,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
     return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
 
-def backward(ctx, grad_out: Tensor, *_):
+def mm_backward(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
     x_s, w_s, grad_s = ctx.scales
     grad_x, grad_w = torch.ops.nanogpt.mm_backward(
@@ -90,14 +90,14 @@ def backward(ctx, grad_out: Tensor, *_):
     )
     return grad_x, grad_w, None, None, None
 
-def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+def mm_setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     *_, x_s, w_s, grad_s = inputs
     _, x_f8, w_f8 = output
     ctx.save_for_backward(x_f8, w_f8)
     ctx.scales = x_s, w_s, grad_s
     ctx.set_materialize_grads(False)
 
-mm_op.register_autograd(backward, setup_context=setup_context)
+mm_op.register_autograd(mm_backward, setup_context=mm_setup_context)
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -218,12 +218,12 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, use_fp8: bool = False, x_scale: float = 1.0, w_scale: float = 1.0, grad_scale: float = 1.0):
+    def __init__(self, in_features: int, out_features: int, use_fp8: bool = False, x_s: float = 1.0, w_s: float = 1.0, grad_s: float = 1.0):
         super().__init__(in_features, out_features, bias=False)
         self.use_fp8 = use_fp8
-        self.x_scale = x_scale
-        self.w_scale = w_scale
-        self.grad_scale = grad_scale
+        self.x_s = x_s
+        self.w_s = w_s
+        self.grad_s = grad_s
 
     def reset_parameters(self) -> None:
         std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
@@ -234,11 +234,10 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor):
         if self.use_fp8 and self.training:
             _x = x.flatten(0, -2)
-            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_scale, w_s=self.w_scale, grad_s=self.grad_scale)[0]
+            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                return F.linear(x, self.weight.type_as(x))
+            return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -355,7 +354,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_scale=2.0, w_scale=2.0**9, grad_scale=2.0**19)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
     def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
