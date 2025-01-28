@@ -2,16 +2,16 @@
 
 Changelogs:
 
-1. Reduced training per-device sequence length from `64*1024` to `48*1024`. See [Critical Batch Size](https://arxiv.org/abs/2410.21676) literature.
-2. Increased eval per-device sequence length from `64*1024` to `4*64*1024` (decreases `val_loss` by `~0.0015`)
+1. Reduced per-device training sequence length from `64*1024` to `48*1024`. See [Critical Batch Size](https://arxiv.org/abs/2410.21676) literature.
+2. Increased per-device eval sequence length from `64*1024` to `4*64*1024`. This improves `val_loss` by `~0.0015` or an equivalent of a reduction of 10 training steps. Overall it saves `~1 sec` of training time.
 3. Modified scales for `fp8` training of LM Head. Saves `1 sec` and improves `val_loss` by as much as `~0.01` after reducing training sequence length down to `48*1024`. I don't know wtf is causing this and I'm NOT going crazy about this. I have evidence. See `records/012625_MiscTweaks/no-autocast-same-fp8-scales`.
     - `w_s = 2.0**9` (from `2.0**5`)
     - `grad_s = 2.0**19` (from `2.0**29`)
-4. Upgrade PyTorch to 2.7.0 nightly version (20250125) for CUDA 12.6
-  - `pip install --pre torch==2.7.0.dev20250125+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126`
+4. Upgraded PyTorch to 2.7.0 nightly version (20250125) for CUDA 12.6
+     - `pip install --pre torch==2.7.0.dev20250125+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126`
 
-![](val_losses.png)
-![](wallclock.png)
+![](new-train-seqlen--new-val-seqlen--new-fp8-scales/val_losses.png)
+![](new-train-seqlen--new-val-seqlen--new-fp8-scales/wallclock.png)
 
 ![](ablations.png)
 
