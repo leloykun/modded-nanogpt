@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from collections import defaultdict
+import numpy as np
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
@@ -559,6 +562,9 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
+if master_process:
+    param_name_to_grad_scale_map = defaultdict(lambda: 1e9)
+    param_name_to_weight_scale_map = defaultdict(lambda: 1e9)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
@@ -611,6 +617,19 @@ for step in range(train_steps + 1):
         model(input_seq, target_seq, sw_num_blks(window_size)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+    if master_process and step % 125 == 10:
+        for name, param in model.named_parameters():
+            if not ("c_proj" in name or "c_fc" in name or "lm_head" in name):
+                continue
+            if param.grad is not None:
+                grad_max_abs = param.grad.abs().max().item()
+                weight_max_abs = param.abs().max().item()
+                grad_scale = np.floor(np.log2(0.8 * 40896.0 / grad_max_abs)) if grad_max_abs > 1e-9 else 1
+                weight_scale = np.floor(np.log2(0.8 * 448.0 / weight_max_abs)) if weight_max_abs > 1e-9 else 1
+                if step > 0:
+                    param_name_to_grad_scale_map[name] = min(param_name_to_grad_scale_map[name], grad_scale)
+                    param_name_to_weight_scale_map[name] = min(param_name_to_weight_scale_map[name], weight_scale)
+                print0(f"{name:<40} | weight_scale={weight_scale:<3} | grad_scale={grad_scale:<3}", console=True)
     # momentum warmup for Muon
     frac = min(step / 300, 1)
     for group in optimizer2.param_groups:
@@ -624,6 +643,12 @@ for step in range(train_steps + 1):
     # logging
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
+if master_process:
+    param_names = list(param_name_to_grad_scale_map.keys())
+    for name in param_names:
+        grad_scale = param_name_to_grad_scale_map[name]
+        weight_scale = param_name_to_weight_scale_map[name]
+        print0(f"{name:<40} | weight_scale={weight_scale:<3} | grad_scale={grad_scale:<3}", console=True)
 
 print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
