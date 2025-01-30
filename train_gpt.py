@@ -29,8 +29,8 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
     @torch.compile
     def impl(x: Tensor, w: Tensor):
         assert x.is_contiguous() and w.is_contiguous()
-        x_f8 = x.mul(x_s).to(torch.float8_e5m2)
-        w_f8 = w.mul(w_s).to(torch.float8_e5m2)
+        x_f8 = x.mul(x_s).to(torch.float8_e4m3fn)
+        w_f8 = w.mul(w_s).to(torch.float8_e4m3fn)
         out = torch._scaled_mm(
             x_f8,
             w_f8.t(),
@@ -299,7 +299,7 @@ class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
-        self.c_fc = CastedLinear(dim, hdim)
+        self.c_fc = CastedLinear(dim, hdim, use_fp8=True, x_s=2.0, w_s=2.0**7, grad_s=2.0**21)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
