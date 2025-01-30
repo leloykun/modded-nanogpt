@@ -59,7 +59,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
         x_inv_s = grad.new_tensor(1 / x_s, dtype=torch.float32)
         w_inv_s = grad.new_tensor(1 / w_s, dtype=torch.float32)
         grad_inv_s = grad.new_tensor(1 / grad_s, dtype=torch.float32)
-        grad_f8 = grad.mul(grad_s).to(torch.float8_e4m3fn)
+        grad_f8 = grad.mul(grad_s).to(torch.float8_e5m2)
         grad_x = torch._scaled_mm(
             grad_f8,
             w_f8.t().contiguous().t(),
@@ -566,6 +566,7 @@ if master_process:
     param_name_to_grad_scale_map = defaultdict(lambda: 1e9)
     param_name_to_grad_scale2_map = defaultdict(lambda: 1e9)
     param_name_to_weight_scale_map = defaultdict(lambda: 1e9)
+    param_name_to_weight_scale2_map = defaultdict(lambda: 1e9)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
@@ -625,14 +626,16 @@ for step in range(train_steps + 1):
             if param.grad is not None:
                 grad_max_abs = param.grad.abs().max().item()
                 weight_max_abs = param.abs().max().item()
-                grad_scale = np.floor(np.log2(0.8 * 57344. / grad_max_abs)) if grad_max_abs > 1e-9 else 1
-                grad_scale2 = np.floor(np.log2(0.8 * 448. / grad_max_abs)) if grad_max_abs > 1e-9 else 1
+                grad_scale = np.floor(np.log2(0.8 * 448. / grad_max_abs)) if grad_max_abs > 1e-9 else 1
+                grad_scale2 = np.floor(np.log2(0.8 * 57344. / grad_max_abs)) if grad_max_abs > 1e-9 else 1
                 weight_scale = np.floor(np.log2(0.8 * 448. / weight_max_abs)) if weight_max_abs > 1e-9 else 1
+                weight_scale2 = np.floor(np.log2(0.8 * 57344. / weight_max_abs)) if weight_max_abs > 1e-9 else 1
                 if step > 0:
                     param_name_to_grad_scale_map[name] = min(param_name_to_grad_scale_map[name], grad_scale)
                     param_name_to_grad_scale2_map[name] = min(param_name_to_grad_scale2_map[name], grad_scale2)
                     param_name_to_weight_scale_map[name] = min(param_name_to_weight_scale_map[name], weight_scale)
-                print0(f"{name:<40} | weight_scale={weight_scale:<3} | grad_scale={grad_scale:<3} | grad_scale2={grad_scale2:<3}", console=True)
+                    param_name_to_weight_scale2_map[name] = min(param_name_to_weight_scale2_map[name], weight_scale2)
+                print0(f"{name:<40} | weight_scale={weight_scale:<3} | weight_scale2={weight_scale2:<3} | grad_scale={grad_scale:<3} | grad_scale2={grad_scale2:<3}", console=True)
     # momentum warmup for Muon
     frac = min(step / 300, 1)
     for group in optimizer2.param_groups:
@@ -652,7 +655,8 @@ if master_process:
         grad_scale = param_name_to_grad_scale_map[name]
         grad_scale2 = param_name_to_grad_scale2_map[name]
         weight_scale = param_name_to_weight_scale_map[name]
-        print0(f"{name:<40} | weight_scale={weight_scale:<3} | grad_scale={grad_scale:<3} | grad_scale2={grad_scale2:<3}", console=True)
+        weight_scale2 = param_name_to_weight_scale2_map[name]
+        print0(f"{name:<40} | weight_scale={weight_scale:<3} | weight_scale2={weight_scale2:<3} | grad_scale={grad_scale:<3} | grad_scale2={grad_scale2:<3}", console=True)
 
 print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
