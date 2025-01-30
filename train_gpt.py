@@ -624,8 +624,8 @@ for step in range(train_steps + 1):
             if param.grad is not None:
                 grad_max_abs = param.grad.abs().max().item()
                 weight_max_abs = param.abs().max().item()
-                grad_scale = np.floor(np.log2(0.8 * 40896.0 / grad_max_abs)) if grad_max_abs > 1e-9 else 1
-                weight_scale = np.floor(np.log2(0.8 * 448.0 / weight_max_abs)) if weight_max_abs > 1e-9 else 1
+                grad_scale = np.floor(np.log2(0.8 * 57344. / grad_max_abs)) if grad_max_abs > 1e-9 else 1
+                weight_scale = np.floor(np.log2(0.8 * 448. / weight_max_abs)) if weight_max_abs > 1e-9 else 1
                 if step > 0:
                     param_name_to_grad_scale_map[name] = min(param_name_to_grad_scale_map[name], grad_scale)
                     param_name_to_weight_scale_map[name] = min(param_name_to_weight_scale_map[name], weight_scale)
