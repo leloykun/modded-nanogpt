@@ -59,7 +59,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
         x_inv_s = grad.new_tensor(1 / x_s, dtype=torch.float32)
         w_inv_s = grad.new_tensor(1 / w_s, dtype=torch.float32)
         grad_inv_s = grad.new_tensor(1 / grad_s, dtype=torch.float32)
-        grad_f8 = grad.mul(grad_s).to(torch.float8_e5m2)
+        grad_f8 = grad.mul(grad_s).to(torch.float8_e4m3fn)
         grad_x = torch._scaled_mm(
             grad_f8,
             w_f8.t().contiguous().t(),
@@ -357,7 +357,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=False, x_s=2.0, w_s=2.0**7, grad_s=2.0**18)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=False, x_s=2.0, w_s=2.0**8, grad_s=2.0**12)
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
     def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
