@@ -357,7 +357,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2, w_s=2**9, grad_s=2**19)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=False, x_s=2, w_s=2**9, grad_s=2**19)
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
     def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
@@ -472,12 +472,12 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
-    num_iterations = 940 # number of iterations to run
+    num_iterations = 2800 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
-    seq_len = 96*1024 # FlexAttention sequence length
+    seq_len = 32*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     save_checkpoint = False
 args = Hyperparameters()
