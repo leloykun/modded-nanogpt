@@ -29,8 +29,8 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
     @torch.compile
     def impl(x: Tensor, w: Tensor):
         assert x.is_contiguous() and w.is_contiguous()
-        x_f8 = x.mul(x_s).to(torch.float8_e4m3fn)
-        w_f8 = w.mul(w_s).to(torch.float8_e4m3fn)
+        x_f8 = x.mul(x_s).to(torch.float8_e5m2)
+        w_f8 = w.mul(w_s).to(torch.float8_e5m2)
         out = torch._scaled_mm(
             x_f8,
             w_f8.t(),
@@ -357,7 +357,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=False, x_s=2.0, w_s=2.0**8, grad_s=2.0**12)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**14, grad_s=2.0**19)
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
     def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
