@@ -453,7 +453,7 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1770 # number of iterations to run
+    num_iterations = 1755 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
@@ -629,7 +629,7 @@ for step in range(train_steps + 1):
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
     for group in optimizer2.param_groups:
-        frac = min(step / 600, 1) # momentum warmup for muon
+        frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers
     for opt in optimizers:
