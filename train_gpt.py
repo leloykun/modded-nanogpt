@@ -124,13 +124,13 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations
     for a, b, c in [
-        (4.1051, -4.1796, 1.0745),
-        (4.099, -4.1731, 1.0741),
-        (4.0971, -4.1708, 1.0737),
-        (4.0032, -4.0468, 1.0436),
-        (3.4765, -3.3454, 0.8689),
-        (2.926, -2.7908, 0.8648),
-        (2.6148, -2.4711, 0.8562),
+        (3.8786, -3.9938, 1.1152),
+        (3.8659, -3.9766, 1.1106),
+        (3.8507, -3.9587, 1.1080),
+        (3.7800, -3.8706, 1.0906),
+        (3.4840, -3.4588, 0.9748),
+        (2.9530, -2.8471, 0.8941),
+        (2.6541, -2.5238, 0.8698),
     ]:
         A = X @ X.mT
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
