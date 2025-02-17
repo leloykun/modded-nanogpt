@@ -536,7 +536,7 @@ def get_lr(step: int):
         return 1.0
     else:
         w = (1 - x) / args.cooldown_frac
-        return w * 1.0 + (1 - w) * 0.2
+        return w * 1.0 + (1 - w) * 0.1
 
 # attention window size schedule: linearly increase
 @lru_cache(1)
