@@ -28,6 +28,7 @@ RUN python -m pip install --upgrade pip && \
     pip install -r requirements.txt
 
 RUN pip install --pre torch==2.7.0.dev20250125+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
+RUN python data/cached_fineweb10B.py 40
 
 CMD ["bash"]
 ENTRYPOINT []
