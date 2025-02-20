@@ -131,6 +131,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     ]):
         A = X @ X.mT
         if i == 0:
+            # Improve estimate of spectral norm with 1st Gram iteration taken from https://arxiv.org/abs/2305.16173
             S_norm_est_over_f_norm__squared = A.norm(dim=(-2, -1), keepdim=True)
             X = X / (S_norm_est_over_f_norm__squared**0.5 + 1e-7)
             A = A / (S_norm_est_over_f_norm__squared + 1e-7)
@@ -456,7 +457,7 @@ class Hyperparameters:
     train_seq_len = 64*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 7050 # number of iterations to run
+    num_iterations = 7000 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
