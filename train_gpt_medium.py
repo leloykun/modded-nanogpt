@@ -122,14 +122,18 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations
-    for a, b, c in [
-        (3.6000, -6.77, 3.69),
-        (3.6000, -7.43, 4.42),
-        (3.6000, -8.14, 5.33),
-        (3.6000, -8.20, 5.71),
-        (2.5714, -3.05, 1.50),
-    ]:
+    for i, (a, b, c) in enumerate([
+        (4.0848, -6.8946, 2.9270),
+        (3.9505, -6.3029, 2.6377),
+        (3.7418, -5.5913, 2.3037),
+        (2.8769, -3.1427, 1.2046),
+        (2.8366, -3.0525, 1.2012),
+    ]):
         A = X @ X.mT
+        if i == 0:
+            S_norm_est_over_f_norm__squared = A.norm(dim=(-2, 1), keepdim=True)
+            X = X / (S_norm_est_over_f_norm__squared**0.5 + 1e-7)
+            A = A / (S_norm_est_over_f_norm__squared + 1e-7)
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
 
