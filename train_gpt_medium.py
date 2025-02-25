@@ -122,14 +122,18 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations
-    for a, b, c in [
+    for i, (a, b, c) in enumerate([
         (4.0248, -6.4151, 2.5964),
         (3.9871, -6.2708, 2.5309),
         (3.3271, -4.8215, 1.9408),
         (2.8750, -3.6128, 1.6170),
         (3.0134, -3.6462, 1.6158),
-    ]:
+    ]):
         A = X @ X.mT
+        if i == 0:
+            S_norm_est_over_f_norm__squared = A.norm(dim=(-2, -1), keepdim=True)
+            X = X / (S_norm_est_over_f_norm__squared**0.5 + 1e-7)
+            A = A / (S_norm_est_over_f_norm__squared + 1e-7)
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
 
@@ -452,7 +456,7 @@ class Hyperparameters:
     train_seq_len = 64*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 7050 # number of iterations to run
+    num_iterations = 7000 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
