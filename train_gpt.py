@@ -131,10 +131,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         (3.0134, -3.6462, 1.6158),
     ]):
         A = X @ X.mT
-        if i == 0:
-            S_norm_est_over_f_norm__squared = A.norm(dim=(-2, -1), keepdim=True)
-            X = X / (S_norm_est_over_f_norm__squared**0.5 + 1e-7)
-            A = A / (S_norm_est_over_f_norm__squared + 1e-7)
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
     
