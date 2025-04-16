@@ -185,8 +185,9 @@ class Muon(torch.optim.Optimizer):
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
                     # p_world.mul_(1 - group["lr"] * group["weight_decay"] * getattr(p_world, "wd_mul", 1.0))
+                    man_dist = p_world.mT @ p_world - (p_world.size(-2) / p_world.size(-1)) * torch.eye(p_world.size(-1), device=p_world.device)
                     p_world.add_(
-                        p_world @ (p_world.mT @ p_world - (p_world.size(-2) / p_world.size(-1)) * torch.eye(p_world.size(-1), device=p_world.device)),
+                        p_world @ man_dist,
                         alpha=- group["lr"] * group["weight_decay"] * getattr(p_world, "wd_mul", 1.0)
                     )
                     p_world.add_(g_world.view_as(p_world),
