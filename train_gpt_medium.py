@@ -308,8 +308,8 @@ class MLP(nn.Module):
         with torch.no_grad():
             self.c_fc.weight.data = (hdim / dim)**0.5 * zeropower_via_newtonschulz5(self.c_fc.weight.data, 5)
             self.c_proj.weight.data = (dim / hdim)**0.5 * zeropower_via_newtonschulz5(self.c_proj.weight.data, 5)
-        # self.c_fc.weight.wd_mul = 2.0
-        # self.c_proj.weight.wd_mul = 2.0
+        self.c_fc.weight.wd_mul = 2.0
+        self.c_proj.weight.wd_mul = 2.0
 
     def forward(self, x: Tensor):
         x = self.c_fc(x)
