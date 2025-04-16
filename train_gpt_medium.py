@@ -275,8 +275,8 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = CastedLinear(hdim, dim)
         # self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         with torch.no_grad():
-            # for i in range(3):
-            #     self.qkv_w.data[i] = (hdim / dim)**0.5 * zeropower_via_newtonschulz5(self.qkv_w.data[i], steps=5)
+            for i in range(3):
+                self.qkv_w.data[i] = (hdim / dim)**0.5 * zeropower_via_newtonschulz5(self.qkv_w.data[i], steps=5)
             self.c_proj.weight.data = (dim / hdim)**0.5 * zeropower_via_newtonschulz5(self.c_proj.weight.data, steps=5)
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
