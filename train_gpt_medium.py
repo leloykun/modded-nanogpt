@@ -272,7 +272,11 @@ class CausalSelfAttention(nn.Module):
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        with torch.no_grad():
+            # for i in range(3):
+            #     self.qkv_w.data[i] = (hdim / dim)**0.5 * zeropower_via_newtonschulz5(self.qkv_w.data[i], steps=5)
+            self.c_proj.weight = (dim / hdim)**0.5 * zeropower_via_newtonschulz5(self.c_proj.weight, steps=5)
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
@@ -299,9 +303,12 @@ class MLP(nn.Module):
         hdim = 4 * dim
         self.c_fc = CastedLinear(dim, hdim)
         self.c_proj = CastedLinear(hdim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
-        self.c_fc.weight.wd_mul = 2.0
-        self.c_proj.weight.wd_mul = 2.0
+        # self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        with torch.no_grad():
+            self.c_fc.weight = (hdim / dim)**0.5 * zeropower_via_newtonschulz5(self.c_fc.weight, 5)
+            self.c_proj.weight = (dim / hdim)**0.5 * zeropower_via_newtonschulz5(self.c_proj.weight, 5)
+        # self.c_fc.weight.wd_mul = 2.0
+        # self.c_proj.weight.wd_mul = 2.0
 
     def forward(self, x: Tensor):
         x = self.c_fc(x)
