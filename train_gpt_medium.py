@@ -184,12 +184,7 @@ class Muon(torch.optim.Optimizer):
             def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
-                    # p_world.mul_(1 - group["lr"] * group["weight_decay"] * getattr(p_world, "wd_mul", 1.0))
-                    man_dist = p_world.mT @ p_world - max(1., p_world.size(-2) / p_world.size(-1)) * torch.eye(p_world.size(-1), dtype=p_world.dtype, device=p_world.device)
-                    p_world.add_(
-                        p_world @ man_dist,
-                        alpha=- group["lr"] * group["weight_decay"] * getattr(p_world, "wd_mul", 1.0)
-                    )
+                    p_world.mul_(1 - group["lr"] * group["weight_decay"] * getattr(p_world, "wd_mul", 1.0))
                     p_world.add_(g_world.view_as(p_world),
                                  alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
             for base_i in range(len(params))[::self.world_size]:
@@ -203,6 +198,7 @@ class Muon(torch.optim.Optimizer):
                     buf: Tensor = state["momentum_buffer"]
                     buf.lerp_(g, 1 - group["momentum"])
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
                     g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
                 else:
                     g = update_buffer_views[self.rank]
@@ -273,11 +269,7 @@ class CausalSelfAttention(nn.Module):
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
-        # self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
-        with torch.no_grad():
-            for i in range(3):
-                self.qkv_w.data[i] = max(1., hdim / dim)**0.5 * zeropower_via_newtonschulz5(self.qkv_w.data[i], steps=5)
-            self.c_proj.weight.data = max(1., dim / hdim)**0.5 * zeropower_via_newtonschulz5(self.c_proj.weight.data, steps=5)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
@@ -304,10 +296,7 @@ class MLP(nn.Module):
         hdim = 4 * dim
         self.c_fc = CastedLinear(dim, hdim)
         self.c_proj = CastedLinear(hdim, dim)
-        # self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
-        with torch.no_grad():
-            self.c_fc.weight.data = max(1., hdim / dim)**0.5 * zeropower_via_newtonschulz5(self.c_fc.weight.data, 5)
-            self.c_proj.weight.data = max(1., dim / hdim)**0.5 * zeropower_via_newtonschulz5(self.c_proj.weight.data, 5)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         self.c_fc.weight.wd_mul = 2.0
         self.c_proj.weight.wd_mul = 2.0
 
