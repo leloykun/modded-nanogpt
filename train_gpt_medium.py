@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
+# torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
 torch._dynamo.config.compiled_autograd = True
 
 # -----------------------------------------------------------------------------
@@ -398,12 +398,12 @@ def print0(s, console=False):
 from torch._logging._internal import trace_structured # noqa: E402
 import torch._inductor.codecache # noqa: E402
 import torch._inductor.graph # noqa: E402
-def _patched_trace_structured(name, metadata_fn, **kwargs):
-    if name == "inductor_output_code":
-        print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
-    trace_structured(name, metadata_fn, **kwargs)
-torch._inductor.codecache.trace_structured = _patched_trace_structured
-torch._inductor.graph.trace_structured = _patched_trace_structured
+# def _patched_trace_structured(name, metadata_fn, **kwargs):
+#     if name == "inductor_output_code":
+#         print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
+#     trace_structured(name, metadata_fn, **kwargs)
+# torch._inductor.codecache.trace_structured = _patched_trace_structured
+# torch._inductor.graph.trace_structured = _patched_trace_structured
 
 # begin by printing this file (the Python code)
 print0(code)
