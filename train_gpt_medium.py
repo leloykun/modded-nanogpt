@@ -42,15 +42,25 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations
     for a, b, c in [
-        (4.0848, -6.8946, 2.9270),
-        (3.9505, -6.3029, 2.6377),
-        (3.7418, -5.5913, 2.3037),
-        (2.8769, -3.1427, 1.2046),
-        (2.8366, -3.0525, 1.2012),
+        # (4.0848, -6.8946, 2.9270),
+        # (3.9505, -6.3029, 2.6377),
+        # (3.7418, -5.5913, 2.3037),
+        # (2.8769, -3.1427, 1.2046),
+        # (2.8366, -3.0525, 1.2012),
+
+        (7.2086, -15.5131, 9.0178),
+        (3.9623, -2.5813, 0.4542),
+        (3.9466, -2.5765, 0.4544),
+        (3.8991, -2.5671, 0.4566),
+        (3.7186, -2.5308, 0.4653),
+        (3.1390, -2.3073, 0.4733),
+        (2.1715, -1.5246, 0.3885),
+        (1.8648, -1.2224, 0.3577),
     ]:
-        A = X @ X.mT
-        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
+        # A = X @ X.mT
+        # B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        # X = a * X + B @ X
+        X = a * X + (b * (A := X @ X.mT) + c * A @ A) @ X
 
     if G.size(-2) > G.size(-1):
         X = X.mT
