@@ -345,7 +345,7 @@ class CausalSelfAttention(nn.Module):
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
         self.rotary = Rotary(head_dim, max_seq_len)
-        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj = CastedLinear(hdim, dim, use_fp8=True)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
@@ -411,8 +411,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True)
-                                    # , x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
@@ -745,7 +744,7 @@ for step in range(train_steps + 1):
     # step the optimizers
     for opt in optimizers:
         opt.step()
-    fp8_post_optimizer_step(model, step, scale_update_interval=args.scale_update_interval)
+    fp8_post_optimizer_step(model, step+1, scale_update_interval=args.scale_update_interval)
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
