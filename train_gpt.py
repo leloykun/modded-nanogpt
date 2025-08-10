@@ -71,7 +71,7 @@ class FP8LinearFunc(Function):
         grad_w = torch._scaled_mm(
             x_f8.T.contiguous(),
             grad_f8.T.contiguous().T,
-            out_dtype=torch.float32,
+            out_dtype=torch.bfloat16,
             scale_a=x_s_t,
             scale_b=g_s_t,
             use_fast_accum=False,
