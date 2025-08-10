@@ -69,22 +69,14 @@ class FP8LinearFunc(Function):
             scale_b=w_s_t,
             use_fast_accum=False,
         )
-        # grad_w = torch._scaled_mm(
-        #     x_f8.T.contiguous(),
-        #     grad_f8.T.contiguous().T,
-        #     out_dtype=torch.float32,
-        #     scale_a=x_s_t,
-        #     scale_b=g_s_t,
-        #     use_fast_accum=False,
-        # ).mT
         grad_w = torch._scaled_mm(
-            grad_f8.T,
-            x_f8,
+            x_f8.T.contiguous(),
+            grad_f8.T.contiguous().T,
             out_dtype=torch.float32,
-            scale_a=g_s_t,
-            scale_b=x_s_t,
+            scale_a=x_s_t,
+            scale_b=g_s_t,
             use_fast_accum=False,
-        )
+        ).mT
         return grad_x, grad_w, None, None, None, None, None
 
 # -----------------------------------------------------------------------------
