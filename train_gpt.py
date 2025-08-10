@@ -63,7 +63,6 @@ class FP8LinearFunc(Function):
         grad_x = torch._scaled_mm(
             grad_f8,
             w_f8.T.contiguous().T,
-            # w_f8.T,
             out_dtype=torch.bfloat16,
             scale_a=g_s_t,
             scale_b=w_s_t,
@@ -271,22 +270,11 @@ class CastedLinear(nn.Linear):
         self.register_buffer("x_amax_buf", torch.zeros(1, dtype=torch.float32), persistent=False)
         self.register_buffer("g_amax_buf", torch.zeros(1, dtype=torch.float32), persistent=False)
 
-        self.register_buffer(
-            "w_f8T",
-            torch.empty(in_features, out_features, dtype=torch.float8_e4m3fn),
-            persistent=False,
-        )
-
     def reset_parameters(self) -> None:
         std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
         bound = (3 ** 0.5) * std
         with torch.no_grad():
             self.weight.uniform_(-bound, bound)
-
-    @torch.no_grad()
-    def refresh_fp8_weight(self):
-        w_f8 = (self.weight / self.w_s_t).to(torch.float8_e4m3fn).T
-        self.w_f8T.copy_(w_f8)
 
     @torch.no_grad()
     def update_fp8_scales(self, ema_decay: float=0.9):
@@ -324,12 +312,6 @@ def fp8_post_optimizer_step(model: nn.Module, global_step: int, scale_update_int
         for m in model.modules():
             if isinstance(m, CastedLinear) and m.use_fp8:
                 m.update_fp8_scales(ema_decay)
-    for m in model.modules():
-        if isinstance(m, CastedLinear) and m.use_fp8:
-            m.refresh_fp8_weight()
-    if do_update_scales:
-        for m in model.modules():
-            if isinstance(m, CastedLinear) and m.use_fp8:
                 m.reset_amax_buffers()
 
 class Rotary(nn.Module):
