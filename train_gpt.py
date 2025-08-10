@@ -572,7 +572,7 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1700 # number of iterations to run
+    num_iterations = 1725 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
