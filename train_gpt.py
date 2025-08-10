@@ -14,6 +14,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
+from torch.autograd import Function
 import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
@@ -21,85 +22,60 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
-# Custom operators: FP8 matmul by @YouJiacheng
+# Custom operators: FP8 matmul by @leloykun (prev impl by @YouJiacheng)
 
-@torch.library.custom_op("nanogpt::mm", mutates_args=())
-def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
-    @torch.compile
-    def impl(x: Tensor, w: Tensor):
-        assert x.is_contiguous() and w.is_contiguous()
-        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
-        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+_TARGET_E4M3 = 448.0 * 0.95
+_TARGET_E5M2 = 57344.0 * 0.95
+
+class FP8LinearFunc(Function):
+    @staticmethod
+    def forward(
+        ctx, x: Tensor, w_f8T: Tensor,
+        x_s_t: Tensor, w_s_t: Tensor, g_s_t: Tensor,
+        x_amax_buf: Tensor, g_amax_buf: Tensor
+    ):
+        with torch.no_grad():
+            x_amax_buf.copy_(torch.maximum(x_amax_buf, x.detach().abs().amax()))
+
+        x_f8 = (x / x_s_t).to(torch.float8_e4m3fn)
+
         out = torch._scaled_mm(
-            x_f8,
-            w_f8.T,
-            out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(w_s, dtype=torch.float32),
-            use_fast_accum=True,
+            x_f8, w_f8T,
+            scale_a=x_s_t, scale_b=w_s_t,
+            out_dtype=torch.bfloat16, use_fast_accum=True,
         )
-        return out, x_f8, w_f8
+        ctx.save_for_backward(x_f8, w_f8T)
+        ctx.scales = x_s_t, w_s_t, g_s_t
+        ctx.scale_buffers = x_amax_buf, g_amax_buf
+        return out
 
-    return impl(x, w)
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        x_f8, w_f8T = ctx.saved_tensors
+        x_s_t, w_s_t, g_s_t = ctx.scales
+        _, g_amax_buf = ctx.scale_buffers
 
-@mm_op.register_fake
-def _(x: Tensor, w: Tensor, *_):
-    assert x.ndim == w.ndim == 2
-    assert x.shape[1] == w.shape[1]
-    assert x.device == w.device
-    assert x.is_contiguous() and w.is_contiguous()
-    return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+        with torch.no_grad():
+            g_amax_buf.copy_(torch.maximum(g_amax_buf, grad_out.detach().abs().amax()))
 
-@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
-def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    @torch.compile
-    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
-        assert grad.is_contiguous()
-        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
-        w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
-        grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
-        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+        grad_f8 = (grad_out / g_s_t).to(torch.float8_e5m2)
         grad_x = torch._scaled_mm(
             grad_f8,
-            w_f8.T.contiguous().T,
+            w_f8T.mT,
             out_dtype=torch.bfloat16,
-            scale_a=grad_inv_s,
-            scale_b=w_inv_s,
+            scale_a=g_s_t,
+            scale_b=w_s_t,
             use_fast_accum=False,
         )
-        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
         grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_f8.T.contiguous().T,
+            x_f8.mT,
+            grad_f8,
             out_dtype=torch.float32,
-            scale_a=x_inv_s,
-            scale_b=grad_inv_s,
+            scale_a=x_s_t,
+            scale_b=g_s_t,
             use_fast_accum=False,
-        ).T
-        return grad_x, grad_w
-
-    return impl(g, x_f8, w_f8)
-
-@mm_backward_op.register_fake
-def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.T.contiguous().T.to(torch.float32)
-
-def backward(ctx, grad_out: Tensor, *_):
-    x_f8, w_f8 = ctx.saved_tensors
-    x_s, w_s, grad_s = ctx.scales
-    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
-        grad_out, x_f8, w_f8, x_s, w_s, grad_s
-    )
-    return grad_x, grad_w, None, None, None
-
-def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
-    *_, x_s, w_s, grad_s = inputs
-    _, x_f8, w_f8 = output
-    ctx.save_for_backward(x_f8, w_f8)
-    ctx.scales = x_s, w_s, grad_s
-    ctx.set_materialize_grads(False)
-
-mm_op.register_autograd(backward, setup_context=setup_context)
+        ).mT
+        return grad_x, grad_w, None, None, None, None, None
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -284,10 +260,20 @@ def norm(x: Tensor):
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
-        self.use_fp8 = use_fp8
-        self.x_s = x_s
-        self.w_s = w_s
-        self.grad_s = grad_s
+        self.use_fp8 = bool(use_fp8)
+
+        self.register_buffer("x_s_t", torch.tensor(float(x_s), dtype=torch.float32))
+        self.register_buffer("w_s_t", torch.tensor(float(w_s), dtype=torch.float32))
+        self.register_buffer("g_s_t", torch.tensor(float(grad_s), dtype=torch.float32))
+
+        self.register_buffer("x_amax_buf", torch.zeros(1, dtype=torch.float32), persistent=False)
+        self.register_buffer("g_amax_buf", torch.zeros(1, dtype=torch.float32), persistent=False)
+
+        self.register_buffer(
+            "w_f8T",
+            torch.empty(in_features, out_features, dtype=torch.float8_e4m3fn),
+            persistent=False,
+        )
 
     def reset_parameters(self) -> None:
         std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
@@ -295,13 +281,54 @@ class CastedLinear(nn.Linear):
         with torch.no_grad():
             self.weight.uniform_(-bound, bound)
 
+    @torch.no_grad()
+    def refresh_fp8_weight(self):
+        w_f8 = (self.weight / self.w_s_t).to(torch.float8_e4m3fn).T.contiguous()
+        self.w_f8T.copy_(w_f8)
+
+    @torch.no_grad()
+    def update_fp8_scales(self, ema_decay: float=0.9):
+        if self.x_amax_buf.item() > 0:
+            target = max(self.x_amax_buf.item() / _TARGET_E4M3, 1e-8)
+            self.x_s_t.mul_(ema_decay).add_(target * (1 - ema_decay))
+        if self.g_amax_buf.item() > 0:
+            target = max(self.g_amax_buf.item() / _TARGET_E5M2, 1e-8)
+            self.g_s_t.mul_(ema_decay).add_(target * (1 - ema_decay))
+        w_amax = self.weight.detach().abs().amax()
+        target = max(w_amax.item() / _TARGET_E4M3, 1e-8)
+        self.w_s_t.mul_(ema_decay).add_(target * (1 - ema_decay))
+
+    @torch.no_grad()
+    def reset_amax_buffers(self):
+        self.x_amax_buf.zero_()
+        self.g_amax_buf.zero_()
+
     def forward(self, x: Tensor):
         if self.use_fp8 and self.training:
             _x = x.flatten(0, -2)
-            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
+            out = FP8LinearFunc.apply(
+                _x, self.w_f8T,
+                self.x_s_t, self.w_s_t, self.g_s_t,
+                self.x_amax_buf, self.g_amax_buf,
+            )
             return out.reshape(*x.shape[:-1], -1)
         else:
             return F.linear(x, self.weight.type_as(x))
+
+@torch.no_grad()
+def fp8_post_optimizer_step(model: nn.Module, global_step: int, scale_update_interval: int=64, ema_decay: float=0.9):
+    do_update_scales = (global_step % scale_update_interval) == 0
+    if do_update_scales:
+        for m in model.modules():
+            if isinstance(m, CastedLinear) and m.use_fp8:
+                m.update_fp8_scales(ema_decay)
+    for m in model.modules():
+        if isinstance(m, CastedLinear) and m.use_fp8:
+            m.refresh_fp8_weight()
+    if do_update_scales:
+        for m in model.modules():
+            if isinstance(m, CastedLinear) and m.use_fp8:
+                m.reset_amax_buffers()
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -566,6 +593,8 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    #
+    scale_update_interval = 25
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -731,6 +760,7 @@ for step in range(train_steps + 1):
     # step the optimizers
     for opt in optimizers:
         opt.step()
+    fp8_post_optimizer_step(model, step+1, scale_update_interval=args.scale_update_interval)
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
