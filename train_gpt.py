@@ -30,30 +30,29 @@ _TARGET_E5M2 = 57344.0 * 0.95
 class FP8LinearFunc(Function):
     @staticmethod
     def forward(
-        ctx, x: Tensor, w_f8T: Tensor,
+        ctx, x: Tensor, w: Tensor,
         x_s_t: Tensor, w_s_t: Tensor, g_s_t: Tensor,
         x_amax_buf: Tensor, g_amax_buf: Tensor
     ):
-        # assert x.is_contiguous() and w.is_contiguous()
+        assert x.is_contiguous() and w.is_contiguous()
         with torch.no_grad():
             x_amax_buf.copy_(torch.maximum(x_amax_buf, x.detach().abs().amax()))
 
         x_f8 = (x / x_s_t).to(torch.float8_e4m3fn)
-        # w_f8 = (w / w_s_t).to(torch.float8_e4m3fn)
+        w_f8 = (w / w_s_t).to(torch.float8_e4m3fn)
         out = torch._scaled_mm(
-            # x_f8, w_f8.T,
-            x_f8, w_f8T,
+            x_f8, w_f8.T,
             scale_a=x_s_t, scale_b=w_s_t,
             out_dtype=torch.bfloat16, use_fast_accum=True,
         )
-        ctx.save_for_backward(x_f8, w_f8T)
+        ctx.save_for_backward(x_f8, w_f8)
         ctx.scales = x_s_t, w_s_t, g_s_t
         ctx.scale_buffers = g_amax_buf
         return out
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):
-        x_f8, w_f8T = ctx.saved_tensors
+        x_f8, w_f8 = ctx.saved_tensors
         x_s_t, w_s_t, g_s_t = ctx.scales
         g_amax_buf = ctx.scale_buffers
 
@@ -63,8 +62,7 @@ class FP8LinearFunc(Function):
         grad_f8 = (grad_out / g_s_t).to(torch.float8_e5m2)
         grad_x = torch._scaled_mm(
             grad_f8,
-            w_f8T.T.contiguous().T,
-            # w_f8T,
+            w_f8.T.contiguous().T,
             out_dtype=torch.bfloat16,
             scale_a=g_s_t,
             scale_b=w_s_t,
@@ -310,7 +308,7 @@ class CastedLinear(nn.Linear):
         if self.use_fp8 and self.training:
             _x = x.flatten(0, -2)
             out = FP8LinearFunc.apply(
-                _x, self.w_f8T,
+                _x, self.weight,
                 self.x_s_t, self.w_s_t, self.g_s_t,
                 self.x_amax_buf, self.g_amax_buf,
             )
