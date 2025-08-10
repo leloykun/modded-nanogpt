@@ -61,15 +61,15 @@ class FP8LinearFunc(Function):
         grad_f8 = (grad_out / g_s_t).to(torch.float8_e5m2)
         grad_x = torch._scaled_mm(
             grad_f8,
-            w_f8T.mT,
+            w_f8T.T,
             out_dtype=torch.bfloat16,
             scale_a=g_s_t,
             scale_b=w_s_t,
             use_fast_accum=False,
         )
         grad_w = torch._scaled_mm(
-            x_f8.mT,
-            grad_f8,
+            x_f8.T.contiguous(),
+            grad_f8.T.contiguous().T,
             out_dtype=torch.float32,
             scale_a=x_s_t,
             scale_b=g_s_t,
