@@ -62,20 +62,29 @@ class FP8LinearFunc(Function):
         grad_f8 = (grad_out / g_s_t).to(torch.float8_e5m2)
         grad_x = torch._scaled_mm(
             grad_f8,
-            w_f8.T.contiguous().T,
+            # w_f8.T.contiguous().T,
+            w_f8.T,
             out_dtype=torch.bfloat16,
             scale_a=g_s_t,
             scale_b=w_s_t,
             use_fast_accum=False,
         )
+        # grad_w = torch._scaled_mm(
+        #     x_f8.T.contiguous(),
+        #     grad_f8.T.contiguous().T,
+        #     out_dtype=torch.float32,
+        #     scale_a=x_s_t,
+        #     scale_b=g_s_t,
+        #     use_fast_accum=False,
+        # ).mT
         grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_f8.T.contiguous().T,
+            grad_f8.T,
+            x_f8,
             out_dtype=torch.float32,
-            scale_a=x_s_t,
-            scale_b=g_s_t,
+            scale_a=g_s_t,
+            scale_b=x_s_t,
             use_fast_accum=False,
-        ).mT
+        )
         return grad_x, grad_w, None, None, None, None, None
 
 # -----------------------------------------------------------------------------
@@ -362,7 +371,7 @@ class CausalSelfAttention(nn.Module):
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
         self.rotary = Rotary(head_dim, max_seq_len)
-        self.c_proj = CastedLinear(hdim, dim, use_fp8=True)
+        self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
@@ -387,8 +396,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
-        self.c_fc = CastedLinear(dim, hdim, use_fp8=True)
-        self.c_proj = CastedLinear(hdim, dim, use_fp8=True)
+        self.c_fc = CastedLinear(dim, hdim)
+        self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
