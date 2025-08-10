@@ -745,7 +745,7 @@ for step in range(train_steps + 1):
     # step the optimizers
     for opt in optimizers:
         opt.step()
-    fp8_post_optimizer_step(model, step+1, scale_update_interval=args.scale_update_interval)
+    fp8_post_optimizer_step(model, step, scale_update_interval=args.scale_update_interval)
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
