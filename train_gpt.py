@@ -574,7 +574,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
 
     # Consumer: only perform the fast, non_blocking H2D copies and dtype conversions
     while True:
-        buf = q.get()
+        buf = q.get(block=True)
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)  # no sync on host side
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)  # H2D in another stream isn't helpful.
         yield inputs, targets
@@ -707,6 +707,8 @@ del train_loader, initial_state
 ########################################
 
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+inputs, targets = next(train_loader)  # warmup the data loader; we don't use this data for training
+
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
