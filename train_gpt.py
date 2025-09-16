@@ -707,6 +707,7 @@ del train_loader, initial_state
 ########################################
 
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+inputs, targets = next(train_loader)  # warmup the data loader
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
