@@ -9,6 +9,8 @@ import glob
 from dataclasses import dataclass
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
+import threading
+from queue import Queue
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -511,42 +513,70 @@ def _load_data_shard(file: Path):
     return tokens
 
 # find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap
-def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
+def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int, world_size: int) -> tuple[list[int], int]:
     boundary_mask = tokens[pos : pos + max_batch_span] == 50256
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
-    start = boundary_positions[0].item()
-    starts = []
+    start = int(boundary_positions[0].item())
+    starts: list[int] = []
     for i in range(1, len(boundary_positions)):
-        end = boundary_positions[i].item() 
+        end = int(boundary_positions[i].item())
         if end - start >= local_batch_size:
             starts.append(start) # append start once end pos is confirmed
-            if len(starts) == dist.get_world_size():
-                return starts, end - pos
+            if len(starts) == world_size:
+                return starts, int(end - pos)
             start = end
     assert False # increase max_batch_span if necessary
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
+    """
+    Background-prefetching data loader.
+    - Offloads CPU-heavy find_batch_starts and file IO to a background thread.
+    - Main thread only performs non_blocking H2D copies from pinned CPU memory.
+    This overlaps CPU work with GPU compute and reduces iteration latency.
+    """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
-    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
-    tokens, pos = _load_data_shard(next(file_iter)), 0
-    max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
+    max_batch_span = 2 * batch_size if align_to_bos else batch_size  # provide buffer to handle samples up to length local_batch_size
+
+    # Thread-safe queue for CPU pinned token views; keep small depth to bound memory
+    queue_depth = 8
+    q: Queue[Tensor] = Queue(maxsize=queue_depth)
+    ready = threading.Event()
+
+    def producer():
+        # All heavy CPU work (IO + boundary search) happens here
+        file_iter = iter(files)  # use itertools.cycle(files) instead if you want to do multi-epoch training
+        tokens, pos = _load_data_shard(next(file_iter)), 0
+        while True:
+            if pos + max_batch_span + 1 >= len(tokens):
+                tokens, pos = _load_data_shard(next(file_iter)), 0
+            if align_to_bos:
+                # Pass world_size explicitly to avoid repeated dist calls in host loop
+                batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span, world_size)
+                start_idx = batch_starts[rank]
+            else:
+                batch_span = batch_size
+                start_idx = pos + rank * local_batch_size
+            # Create a view into pinned CPU tokens; no extra copy
+            buf = tokens[start_idx: start_idx + local_batch_size + 1]
+            pos += int(batch_span)
+            q.put(buf)  # blocks if queue is full to apply backpressure
+            if not ready.is_set():
+                ready.set()
+
+    # Start the background thread; daemon so it won't block process exit
+    t = threading.Thread(target=producer, daemon=True)
+    t.start()
+    ready.wait()  # ensure at least one batch is queued before first get()
+
+    # Consumer: only perform the fast, non_blocking H2D copies and dtype conversions
     while True:
-        if pos + max_batch_span + 1 >= len(tokens):
-            tokens, pos = _load_data_shard(next(file_iter)), 0
-        if align_to_bos:
-            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
-            start_idx = batch_starts[rank]
-        else:
-            batch_span = batch_size
-            start_idx = pos + rank * local_batch_size
-        buf = tokens[start_idx:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
-        pos += batch_span
+        buf = q.get()
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)  # no sync on host side
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)  # H2D in another stream isn't helpful.
         yield inputs, targets
 
 # -----------------------------------------------------------------------------
