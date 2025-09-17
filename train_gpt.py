@@ -542,7 +542,8 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
     max_batch_span = 2 * batch_size if align_to_bos else batch_size  # provide buffer to handle samples up to length local_batch_size
 
     # Thread-safe queue for CPU pinned token views; keep small depth to bound memory
-    q: Queue[Tensor] = Queue()
+    queue_depth = 16
+    q: Queue[Tensor] = Queue(maxsize=queue_depth)
 
     def producer():
         # All heavy CPU work (IO + boundary search) happens here
