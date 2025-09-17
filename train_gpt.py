@@ -542,9 +542,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
     max_batch_span = 2 * batch_size if align_to_bos else batch_size  # provide buffer to handle samples up to length local_batch_size
 
     # Thread-safe queue for CPU pinned token views; keep small depth to bound memory
-    queue_depth = 8
-    q: Queue[Tensor] = Queue(maxsize=queue_depth)
-    ready = threading.Event()
+    q: Queue[Tensor] = Queue()
 
     def producer():
         # All heavy CPU work (IO + boundary search) happens here
@@ -564,17 +562,14 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
             buf = tokens[start_idx: start_idx + local_batch_size + 1]
             pos += int(batch_span)
             q.put(buf)  # blocks if queue is full to apply backpressure
-            if not ready.is_set():
-                ready.set()
 
     # Start the background thread; daemon so it won't block process exit
     t = threading.Thread(target=producer, daemon=True)
     t.start()
-    ready.wait()  # ensure at least one batch is queued before first get()
 
     # Consumer: only perform the fast, non_blocking H2D copies and dtype conversions
     while True:
-        buf = q.get(block=True)
+        buf = q.get()
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)  # no sync on host side
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)  # H2D in another stream isn't helpful.
         yield inputs, targets
